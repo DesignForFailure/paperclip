@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { activityLog, type Db } from "@paperclipai/db";
 import type { IssueReviewPolicy } from "@paperclipai/shared";
@@ -144,4 +145,71 @@ export async function assertIssueReviewVerdictActorAllowed(
       remediation: "Have another writer with issue write access submit the verdict.",
     },
   );
+}
+
+export const HUMAN_ONLY_COMPLETION_REVIEW_SYSTEM_ID = "human-only-completion";
+export const HUMAN_ONLY_COMPLETION_REVIEW_TARGET_KEY = "native_completion_review";
+export const HUMAN_ONLY_COMPLETION_COERCION_MESSAGE =
+  "Review policy `human_only` reserves `done` for a person. Your completion was recorded as a pending " +
+  "completion review (status `in_review`); the write succeeded and needs no retry.";
+
+/**
+ * `human_only` reserves completion for an authenticated user. Instead of
+ * persisting an agent's `done`, the write is coerced to `in_review` with a
+ * human completion review card (the same `native_completion_review` card the
+ * native runtime binds): accepting it as a user sets `done`; rejecting it
+ * returns the issue to the agent as `todo`. The agent keeps its assignment and
+ * its run is not cancelled, and the pending card is a real review path, so
+ * neither the disposition guard nor the stalled-review recovery fires.
+ * Callers pass the row as it is before the write and the status the write
+ * would persist.
+ */
+export function shouldCoerceAgentCompletionToReview(input: {
+  issue: { status: string; reviewPolicy?: IssueReviewPolicy | null };
+  nextStatus: unknown;
+  actorAgentId: string | null | undefined;
+}): boolean {
+  return (
+    Boolean(input.actorAgentId) &&
+    input.nextStatus === "done" &&
+    input.issue.status !== "done" &&
+    input.issue.reviewPolicy === "human_only"
+  );
+}
+
+/**
+ * Each card gets its own target revision. Accepting a completion review only
+ * sets `done` when no other card for the same revision is unresolved, so a
+ * shared revision would let an earlier rejected card block a later approval.
+ */
+export function buildHumanOnlyCompletionReviewInput(input: {
+  runId: string | null | undefined;
+  addresseeUserId: string | null | undefined;
+}) {
+  return {
+    kind: "request_confirmation" as const,
+    ...(input.runId ? { sourceRunId: input.runId } : {}),
+    resolverPolicy: "human_only" as const,
+    addresseeAgentId: null,
+    addresseeUserId: input.addresseeUserId ?? null,
+    title: "Completion review requested",
+    summary: "The assigned agent reported this work as done. Review policy `human_only` reserves `done` for a person.",
+    continuationPolicy: "wake_assignee" as const,
+    payload: {
+      version: 1 as const,
+      prompt: "The agent reports this work is complete. Approve completion to mark it done, or send it back with a reason.",
+      detailsMarkdown: null,
+      acceptLabel: "Approve completion",
+      rejectLabel: "Continue work",
+      allowDeclineReason: true,
+      rejectRequiresReason: true,
+      supersedeOnUserComment: false,
+      target: {
+        type: "custom" as const,
+        key: HUMAN_ONLY_COMPLETION_REVIEW_TARGET_KEY,
+        revisionId: `human-only:${randomUUID()}`,
+        label: "Completion decision",
+      },
+    },
+  };
 }

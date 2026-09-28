@@ -134,6 +134,47 @@ describe("paperclip issue update helper", () => {
     expect(result.stderr).toContain("echoed status in_progress");
   });
 
+  it("treats a human_only completion review coercion as a saved write and does not retry", async () => {
+    const { baseUrl, requests } = await startServer((_request, _attempt, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "issue-1",
+        status: "in_review",
+        completionCoercion: {
+          requestedStatus: "done",
+          appliedStatus: "in_review",
+          reviewInteractionId: "card-1",
+          reusedPendingReview: false,
+          message: "Review policy `human_only` reserves `done` for a person.",
+        },
+      }));
+    });
+
+    const result = await runHelper(baseUrl, doneArgs);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ id: "issue-1", status: "in_review" });
+    expect(result.stderr).toContain("saved as in_review instead of done");
+    expect(result.stderr).toContain("human_only");
+    expect(requests).toHaveLength(1);
+  });
+
+  it("still fails a status mismatch whose coercion does not match the requested status", async () => {
+    const { baseUrl } = await startServer((_request, _attempt, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "issue-1",
+        status: "in_review",
+        completionCoercion: { requestedStatus: "cancelled", appliedStatus: "in_review" },
+      }));
+    });
+
+    const result = await runHelper(baseUrl, doneArgs);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("echoed status in_review");
+  });
+
   it("does not retry a definitive 4xx rejection", async () => {
     const { baseUrl, requests } = await startServer((_request, _attempt, res) => {
       res.writeHead(422, { "content-type": "application/json" });

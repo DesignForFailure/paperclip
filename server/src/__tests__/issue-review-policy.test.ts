@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, createDb, issues, type Db } from "@paperclipai/db";
 import { HttpError } from "../errors.js";
+import { createIssueThreadInteractionSchema } from "@paperclipai/shared";
 import {
   assertIssueReviewVerdictActorAllowed,
+  buildHumanOnlyCompletionReviewInput,
   isIssueReviewVerdictInteraction,
+  shouldCoerceAgentCompletionToReview,
 } from "../services/issue-review-policy.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -239,5 +242,57 @@ describeEmbeddedPostgres("issue review verdict policy", () => {
       issue: seeded.issue,
       actor: { type: "user", id: "board-user" },
     })).resolves.toBeUndefined();
+  });
+});
+
+describe("human_only completion coercion", () => {
+  const agentId = randomUUID();
+
+  it.each(["backlog", "todo", "in_progress", "blocked", "cancelled", "in_review"] as const)(
+    "coerces an agent's %s -> done on a human_only issue",
+    (status) => {
+      expect(shouldCoerceAgentCompletionToReview({
+        issue: { status, reviewPolicy: "human_only" },
+        nextStatus: "done",
+        actorAgentId: agentId,
+      })).toBe(true);
+    },
+  );
+
+  it.each([
+    ["a user or system write", { status: "in_progress", reviewPolicy: "human_only" }, "done", null],
+    ["an already-done issue", { status: "done", reviewPolicy: "human_only" }, "done", agentId],
+    ["a non-done target", { status: "in_progress", reviewPolicy: "human_only" }, "in_review", agentId],
+    ["no status change", { status: "in_progress", reviewPolicy: "human_only" }, undefined, agentId],
+    ["reviewPolicy null", { status: "in_progress", reviewPolicy: null }, "done", agentId],
+    ["reviewPolicy anyone", { status: "in_progress", reviewPolicy: "anyone" }, "done", agentId],
+    ["reviewPolicy not_creator", { status: "in_progress", reviewPolicy: "not_creator" }, "done", agentId],
+  ] as const)("does not coerce %s", (_label, issue, nextStatus, actorAgentId) => {
+    expect(shouldCoerceAgentCompletionToReview({ issue, nextStatus, actorAgentId })).toBe(false);
+  });
+
+  it("builds a human-only native completion review card that the interaction schema accepts", () => {
+    const runId = randomUUID();
+    const input = buildHumanOnlyCompletionReviewInput({ runId, addresseeUserId: "board-user" });
+    const parsed = createIssueThreadInteractionSchema.parse(input);
+    expect(parsed).toMatchObject({
+      kind: "request_confirmation",
+      resolverPolicy: "human_only",
+      addresseeUserId: "board-user",
+      sourceRunId: runId,
+      continuationPolicy: "wake_assignee",
+      payload: {
+        acceptLabel: "Approve completion",
+        supersedeOnUserComment: false,
+        target: { type: "custom", key: "native_completion_review", revisionId: expect.stringMatching(/^human-only:/) },
+      },
+    });
+  });
+
+  it("gives every completion review card its own target revision", () => {
+    const runId = randomUUID();
+    const first = buildHumanOnlyCompletionReviewInput({ runId, addresseeUserId: "board-user" });
+    const second = buildHumanOnlyCompletionReviewInput({ runId, addresseeUserId: "board-user" });
+    expect(first.payload.target.revisionId).not.toBe(second.payload.target.revisionId);
   });
 });

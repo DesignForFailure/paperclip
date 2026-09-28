@@ -396,6 +396,136 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(persisted).toEqual({ status: "in_review", reviewPolicy: "human_only" });
   });
 
+  it("coerces an agent's human_only done to in_review with a completion review a person approves", async () => {
+    const seeded = await seedCompany("HOC");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HOC-1",
+      status: "in_progress",
+      reviewPolicy: "human_only",
+    });
+    await db.update(issues).set({ createdByUserId: seeded.memberUserId }).where(eq(issues.id, issueId));
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const agentApp = app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId));
+
+    const agentDone = await request(agentApp)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Finished." });
+    expect(agentDone.status, JSON.stringify(agentDone.body)).toBe(200);
+    expect(agentDone.body).toMatchObject({
+      id: issueId,
+      status: "in_review",
+      assigneeAgentId: seeded.assigneeAgentId,
+      completedAt: null,
+      completionCoercion: {
+        requestedStatus: "done",
+        appliedStatus: "in_review",
+        message: expect.stringContaining("human_only"),
+      },
+    });
+    const cardId = agentDone.body.completionCoercion.reviewInteractionId as string;
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(cards).toEqual([
+      expect.objectContaining({ id: cardId, status: "pending", effectiveResolverPolicy: "human_only", addresseeUserId: seeded.memberUserId }),
+    ]);
+    expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .toHaveLength(1);
+    const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.find((row) => row.action === "issue.completion_coerced")).toMatchObject({ actorType: "agent", runId });
+    expect(activity.find((row) => row.action === "issue.updated")?.details).toMatchObject({
+      status: "in_review",
+      reviewInteractionId: cardId,
+      changes: { status: { from: "in_progress", to: "in_review" } },
+    });
+
+    // OpenClaw-style retries stay idempotent: no 403, no second card.
+    for (let i = 0; i < 2; i += 1) {
+      const retry = await request(agentApp).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+      expect(retry.body).toMatchObject({ status: "in_review", completionCoercion: { reviewInteractionId: cardId, reusedPendingReview: true } });
+    }
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId)))
+      .toHaveLength(1);
+
+    const agentAccept = await request(agentApp)
+      .post(`/api/issues/${issueId}/interactions/${cardId}/accept`)
+      .send({});
+    expect(agentAccept.status, JSON.stringify(agentAccept.body)).toBe(403);
+
+    const accepted = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/interactions/${cardId}/accept`)
+      .send({});
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    const [done] = await db.select({ status: issues.status, completedAt: issues.completedAt }).from(issues).where(eq(issues.id, issueId));
+    expect(done?.status).toBe("done");
+    expect(done?.completedAt).toBeInstanceOf(Date);
+  });
+
+  it("still rejects an agent's bare in_review without a review path on a human_only issue", async () => {
+    const seeded = await seedCompany("HIR");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HIR-1",
+      status: "in_progress",
+      reviewPolicy: "human_only",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review" });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body).toMatchObject({ code: "invalid_issue_disposition" });
+  });
+
+  it("coerces an agent stage participant's approval comment on a human_only issue into a completion review", async () => {
+    const seeded = await seedCompany("HAC");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HAC-1",
+      reviewPolicy: "human_only",
+    });
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: seeded.assigneeAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: seeded.assigneeAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+
+    const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "## Review: APPROVED\n\nLooks good." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [persisted] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(persisted?.status).toBe("in_review");
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(cards.filter((row) => (row.payload as any)?.target?.key === "native_completion_review")).toHaveLength(1);
+  });
+
   it("does not let the review requester bypass not_creator by relaxing reviewPolicy in the verdict patch", async () => {
     const seeded = await seedCompany("RNC");
     const issueId = await seedReview({

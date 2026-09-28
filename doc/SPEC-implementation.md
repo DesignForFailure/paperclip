@@ -239,7 +239,7 @@ See `doc/project-repositories.md` for the API and UI contract.
 - `description` text null
 - `status` enum: `backlog | todo | in_progress | in_review | done | blocked | cancelled`
 - `priority` enum: `critical | high | medium | low`
-- `review_policy` nullable enum: `anyone | not_creator | human_only`; null is equivalent to `anyone`
+- `review_policy` nullable enum: `anyone | not_creator | human_only`; null is equivalent to `anyone`. `human_only` also reserves completion for an authenticated user: an agent-attributed write that would move the issue into `done` from any other status (PATCH, approval comment, recovery resolve, interaction accept, plugin update with an agent actor) is persisted as `in_review` instead, with a pending `human_only` completion-review `request_confirmation` (target `custom` / `native_completion_review`). The agent stays assigned and its run continues; the response carries `completionCoercion { requestedStatus, appliedStatus, reviewInteractionId, reusedPendingReview, message }` and the write is logged as `issue.completion_coerced`. Retries reuse the pending card. A user accepting the card sets `done`; rejecting it returns the issue to the assigned agent as `todo`; a user may also set `done` directly. Writes with no actor, and issues created directly in `done`, are not coerced.
 - `assignee_agent_id` uuid fk `agents.id` null
 - `assignee_user_id` text null
 - checkout/execution locks: `checkout_run_id`, `execution_run_id`, `execution_agent_name_key`, `execution_locked_at`
@@ -272,6 +272,7 @@ Invariants:
 - task must trace to company goal chain via `goal_id`, `parent_id`, or project-goal linkage
 - `in_progress` requires assignee
 - an `in_review -> done | cancelled` verdict is authorized against the current review policy while the issue row is locked; a policy change in the same request or a concurrent request cannot relax that verdict gate
+- under `human_only`, an agent-attributed move into `done` is decided against the row-locked policy and persists as `in_review` with a pending completion review; the issue update, the card and the `issue.completion_coerced` activity commit in one transaction
 - accepting or rejecting the review-confirmation interaction locks the issue row before resolving the interaction and reauthorizes against the current review policy in that transaction
 - accepting a fresh `request_confirmation` for the current issue's `plan` revision changes `work_mode = planning` to `work_mode = standard` in the same transaction as the accepted interaction; the existing agent-return transition also moves an eligible `in_review` issue to `todo` without changing its agent owner
 - while a restrictive review policy is stored, changing it requires an actor who is allowed by that row-locked policy

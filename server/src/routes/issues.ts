@@ -320,6 +320,7 @@ import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
   resolveIssueReviewRequester,
+  shouldCoerceAgentCompletionToReview,
 } from "../services/issue-review-policy.js";
 import {
   evaluateIssueThreadInteractionResolverAudience,
@@ -12908,9 +12909,16 @@ export function issueRoutes(
       const reviewPolicyChangeRequested =
         req.body.reviewPolicy !== undefined &&
         req.body.reviewPolicy !== existing.reviewPolicy;
+      // An agent's `done` on a human_only issue is coerced to a completion
+      // review below, not submitted as a verdict.
+      const agentHumanOnlyCompletionRequested =
+        req.actor.type === "agent" &&
+        updateFields.status === "done" &&
+        existing.reviewPolicy === "human_only";
       const reviewVerdictRequested =
         existing.status === "in_review" &&
-        (updateFields.status === "done" || updateFields.status === "cancelled");
+        ((updateFields.status === "done" && !agentHumanOnlyCompletionRequested) ||
+          updateFields.status === "cancelled");
       const reviewPolicySensitiveMutationRequested =
         req.body.reviewPolicy !== undefined ||
         updateFields.status === "done" ||
@@ -13246,6 +13254,17 @@ export function issueRoutes(
         };
       }
       Object.assign(updateFields, transition.patch);
+      // Like an execution policy, rewrite an agent's `done` on a human_only
+      // issue to `in_review`; the issue service binds the human completion
+      // review under the row lock in the same transaction.
+      const humanOnlyCompletionCoerced = shouldCoerceAgentCompletionToReview({
+        issue: existing,
+        nextStatus: updateFields.status,
+        actorAgentId: actor.agentId,
+      });
+      if (humanOnlyCompletionCoerced) {
+        updateFields.status = "in_review";
+      }
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
@@ -13394,15 +13413,18 @@ export function issueRoutes(
         }
       }
 
-      const reviewInteractionId = await assertInReviewReviewPath({
-        existing,
-        updateFields,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        actorAgentId: actor.agentId,
-        actorRunId: actor.runId,
-        reviewInteractionId: requestedReviewInteractionId,
-      });
+      const reviewInteractionId =
+        humanOnlyCompletionCoerced && !requestedReviewInteractionId
+          ? null
+          : await assertInReviewReviewPath({
+              existing,
+              updateFields,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              actorAgentId: actor.agentId,
+              actorRunId: actor.runId,
+              reviewInteractionId: requestedReviewInteractionId,
+            });
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
       const persistReviewActivityTransactionally =
@@ -13570,6 +13592,7 @@ export function issueRoutes(
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        ...(humanOnlyCompletionCoerced ? { humanOnlyCompletionRequested: true } : {}),
       };
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
@@ -13655,6 +13678,16 @@ export function issueRoutes(
               authorizationReason: issueMutationAuthorizationReason,
               changes,
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
+              ...(!reviewInteractionId && updated.completionCoercion
+                ? {
+                    reviewInteractionId: updated.completionCoercion.reviewInteractionId,
+                    completionCoercion: {
+                      requestedStatus: updated.completionCoercion.requestedStatus,
+                      appliedStatus: updated.completionCoercion.appliedStatus,
+                      reusedPendingReview: updated.completionCoercion.reusedPendingReview,
+                    },
+                  }
+                : {}),
               ...(commentBody ? { source: "comment" } : {}),
               ...(resumeRequested === true
                 ? { resumeIntent: true, followUpRequested: true }

@@ -137,6 +137,15 @@ while :; do
     fi
     if [[ -n "$status" ]]; then
       returned_status="$(jq -r '.status // empty' <<<"$body" 2>/dev/null || true)"
+      # Review policy `human_only` records an agent's `done` as a pending
+      # completion review (`in_review`) and says so in `completionCoercion`.
+      # That is a saved write, not a failure, and must not be retried.
+      coerced_status="$(jq -r --arg requested "$status" 'if (.completionCoercion.requestedStatus // "") == $requested then (.completionCoercion.appliedStatus // empty) else empty end' <<<"$body" 2>/dev/null || true)"
+      if [[ -n "$returned_status" && "$returned_status" != "$status" && "$coerced_status" == "$returned_status" ]]; then
+        printf 'Issue update saved as %s instead of %s: %s\n' "$returned_status" "$status" "$(jq -r '.completionCoercion.message // "a person completes this issue."' <<<"$body" 2>/dev/null || true)" >&2
+        printf '%s\n' "$body"
+        exit 0
+      fi
       if [[ "$returned_status" != "$status" ]]; then
         printf 'Issue update FAILED: server echoed status %s instead of requested %s.\n' "${returned_status:-<none>}" "$status" >&2
         printf '%s\n' "$body" >&2

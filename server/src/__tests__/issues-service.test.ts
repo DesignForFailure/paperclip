@@ -47,6 +47,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueWorkMode } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -7221,5 +7222,281 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
       .from(issueComments)
       .where(eq(issueComments.createdByRunId, runId));
     expect(duplicates).toHaveLength(1);
+  });
+});
+
+describeEmbeddedPostgres("issueService.update human_only completion coercion", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let agentId!: string;
+  const boardUserId = "local-board";
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-human-only-coerce-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    companyId = randomUUID();
+    agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Executor",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedIssue(overrides: Partial<typeof issues.$inferInsert> = {}) {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId,
+      title: "Board item",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      reviewPolicy: "human_only",
+      createdByUserId: boardUserId,
+      ...overrides,
+    });
+    return id;
+  }
+
+  async function seedRun(issueId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    return runId;
+  }
+
+  async function rowOf(id: string) {
+    return db
+      .select({
+        status: issues.status,
+        completedAt: issues.completedAt,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(eq(issues.id, id))
+      .then((rows) => rows[0]);
+  }
+
+  async function completionCards(id: string) {
+    return db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, id))
+      .then((rows) => rows.filter((row) => (row.payload as any)?.target?.key === "native_completion_review"));
+  }
+
+  async function coercions(id: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, id))
+      .then((rows) => rows.filter((row) => row.action === "issue.completion_coerced"));
+  }
+
+  it("coerces an agent's in_progress -> done to in_review with a pending human completion review", async () => {
+    const id = await seedIssue();
+    const runId = await seedRun(id);
+
+    const updated = await svc.update(id, { status: "done", actorAgentId: agentId, actorRunId: runId });
+
+    expect(updated).toMatchObject({
+      status: "in_review",
+      completedAt: null,
+      assigneeAgentId: agentId,
+      completionCoercion: {
+        requestedStatus: "done",
+        appliedStatus: "in_review",
+        reusedPendingReview: false,
+        message: expect.stringContaining("needs no retry"),
+      },
+    });
+    expect(updated?.changes?.status).toEqual({ from: "in_progress", to: "in_review" });
+    expect(await rowOf(id)).toEqual({ status: "in_review", completedAt: null, assigneeAgentId: agentId, assigneeUserId: null });
+    const [card] = await completionCards(id);
+    expect(card).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      effectiveResolverPolicy: "human_only",
+      addresseeUserId: boardUserId,
+      sourceRunId: runId,
+      createdByAgentId: null,
+      createdByUserId: null,
+    });
+    expect(updated?.completionCoercion?.reviewInteractionId).toBe(card.id);
+    const [audit] = await coercions(id);
+    expect(audit).toMatchObject({
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId,
+      details: expect.objectContaining({ fromStatus: "in_progress", requestedStatus: "done", appliedStatus: "in_review", reviewInteractionId: card.id }),
+    });
+    const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+  });
+
+  it.each(["backlog", "todo", "blocked", "cancelled"] as const)(
+    "coerces an agent's %s -> done on a human_only issue",
+    async (from) => {
+      const id = await seedIssue({ status: from });
+      const updated = await svc.update(id, { status: "done", actorAgentId: agentId });
+      expect(updated?.status).toBe("in_review");
+      expect(await completionCards(id)).toHaveLength(1);
+    },
+  );
+
+  it("keeps a single pending card when the agent retries done", async () => {
+    const id = await seedIssue();
+    await svc.update(id, { status: "done", actorAgentId: agentId });
+    const retry = await svc.update(id, { status: "done", actorAgentId: agentId });
+    const again = await svc.update(id, { status: "done", actorAgentId: agentId });
+
+    expect(retry?.status).toBe("in_review");
+    expect(again?.completionCoercion?.reusedPendingReview).toBe(true);
+    expect(await completionCards(id)).toHaveLength(1);
+    expect(await coercions(id)).toHaveLength(3);
+  });
+
+  it("completes as the user when a person accepts the completion review", async () => {
+    const id = await seedIssue();
+    const runId = await seedRun(id);
+    const coerced = await svc.update(id, { status: "done", actorAgentId: agentId, actorRunId: runId });
+    const cardId = coerced!.completionCoercion!.reviewInteractionId;
+
+    await expect(
+      issueThreadInteractionService(db).acceptInteraction(
+        { id, companyId, projectId: null, goalId: null, status: "in_review" },
+        cardId,
+        {},
+        { agentId, runId },
+      ),
+    ).rejects.toMatchObject({ status: 403 });
+
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      { id, companyId, projectId: null, goalId: null, status: "in_review" },
+      cardId,
+      {},
+      { userId: boardUserId },
+    );
+    expect(accepted.interaction).toMatchObject({ status: "accepted", resolvedByUserId: boardUserId });
+    const row = await rowOf(id);
+    expect(row?.status).toBe("done");
+    expect(row?.completedAt).toBeInstanceOf(Date);
+  });
+
+  it("returns the issue to the agent as todo when a person sends it back", async () => {
+    const id = await seedIssue();
+    const coerced = await svc.update(id, { status: "done", actorAgentId: agentId });
+    await issueThreadInteractionService(db).rejectInteraction(
+      { id, companyId, status: "in_review" },
+      coerced!.completionCoercion!.reviewInteractionId,
+      { reason: "Tests are missing." },
+      { userId: boardUserId },
+    );
+    expect(await rowOf(id)).toMatchObject({ status: "todo", assigneeAgentId: agentId });
+  });
+
+  it("still completes on a later approval after the agent's earlier completion was sent back in the same run", async () => {
+    const id = await seedIssue();
+    const runId = await seedRun(id);
+    const first = await svc.update(id, { status: "done", actorAgentId: agentId, actorRunId: runId });
+    await issueThreadInteractionService(db).rejectInteraction(
+      { id, companyId, status: "in_review" },
+      first!.completionCoercion!.reviewInteractionId,
+      { reason: "Add the missing test." },
+      { userId: boardUserId },
+    );
+    expect(await rowOf(id)).toMatchObject({ status: "todo", assigneeAgentId: agentId });
+
+    const second = await svc.update(id, { status: "done", actorAgentId: agentId, actorRunId: runId });
+    expect(second?.completionCoercion).toMatchObject({ reusedPendingReview: false });
+    const secondCardId = second!.completionCoercion!.reviewInteractionId;
+    expect(secondCardId).not.toBe(first!.completionCoercion!.reviewInteractionId);
+
+    await issueThreadInteractionService(db).acceptInteraction(
+      { id, companyId, projectId: null, goalId: null, status: "in_review" },
+      secondCardId,
+      {},
+      { userId: boardUserId },
+    );
+    expect((await rowOf(id))?.status).toBe("done");
+  });
+
+  it("lets a user complete a human_only issue directly", async () => {
+    const id = await seedIssue();
+    const updated = await svc.update(id, { status: "done", actorUserId: boardUserId });
+    expect(updated?.status).toBe("done");
+    expect(updated?.completionCoercion).toBeUndefined();
+    expect(await completionCards(id)).toHaveLength(0);
+  });
+
+  it("leaves actorless service writes ungated", async () => {
+    const id = await seedIssue();
+    const updated = await svc.update(id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it.each([null, "anyone", "not_creator"] as const)(
+    "keeps native agent completion when reviewPolicy is %s",
+    async (reviewPolicy) => {
+      const id = await seedIssue({ reviewPolicy });
+      const updated = await svc.update(id, { status: "done", actorAgentId: agentId });
+      expect(updated?.status).toBe("done");
+      expect(await completionCards(id)).toHaveLength(0);
+    },
+  );
+
+  it("treats an agent re-sending done on an already-done human_only issue as a no-op", async () => {
+    const id = await seedIssue({ status: "done", completedAt: new Date() });
+    const updated = await svc.update(id, { status: "done", actorAgentId: agentId });
+    expect(updated?.status).toBe("done");
+    expect(await completionCards(id)).toHaveLength(0);
+  });
+
+  it("commits the coercion with a comment in the caller's transaction", async () => {
+    const id = await seedIssue();
+    await db.transaction(async (tx) => {
+      await svc.addComment(id, "Finished.", { agentId }, undefined, tx);
+      await svc.update(id, { status: "done", actorAgentId: agentId }, tx);
+    });
+    const comments = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, id));
+    expect(comments).toHaveLength(1);
+    expect((await rowOf(id))?.status).toBe("in_review");
+    expect(await completionCards(id)).toHaveLength(1);
+  });
+
+  it("restores done when the route pre-coerced but the locked row no longer requires review", async () => {
+    const id = await seedIssue({ reviewPolicy: "anyone" });
+    const updated = await svc.update(id, { status: "in_review", humanOnlyCompletionRequested: true, actorAgentId: agentId });
+    expect(updated?.status).toBe("done");
+    expect(await completionCards(id)).toHaveLength(0);
   });
 });

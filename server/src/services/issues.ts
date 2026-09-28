@@ -193,6 +193,13 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import {
+  buildHumanOnlyCompletionReviewInput,
+  HUMAN_ONLY_COMPLETION_COERCION_MESSAGE,
+  HUMAN_ONLY_COMPLETION_REVIEW_SYSTEM_ID,
+  HUMAN_ONLY_COMPLETION_REVIEW_TARGET_KEY,
+  shouldCoerceAgentCompletionToReview,
+} from "./issue-review-policy.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
@@ -10541,6 +10548,8 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        /** Set by PATCH when it already rewrote an agent's human_only `done` to `in_review`. */
+        humanOnlyCompletionRequested?: boolean;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10588,6 +10597,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        humanOnlyCompletionRequested,
         ...issueData
       } = data;
       if (
@@ -10866,9 +10876,24 @@ export function issueService(db: Db) {
             agentId: actorAgentId, runId: actorRunId, stopId: actorRunStopId,
           });
         }
-        if (actorAgentId && patch.status === "done") {
+        if (actorAgentId && (patch.status === "done" || humanOnlyCompletionRequested === true)) {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
+        }
+        // Under the row lock: an agent's `done` on a human_only issue becomes
+        // `in_review` with a human completion review (card created below).
+        const completionCoerced = shouldCoerceAgentCompletionToReview({
+          issue: receiptExisting,
+          nextStatus: humanOnlyCompletionRequested === true ? "done" : patch.status,
+          actorAgentId,
+        });
+        if (completionCoerced) {
+          patch.status = "in_review";
+          patch.completedAt = null;
+        } else if (humanOnlyCompletionRequested === true && patch.status === "in_review") {
+          // The route rewrote `done`, but the locked row no longer requires it.
+          patch.status = "done";
+          applyStatusSideEffects("done", patch);
         }
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
@@ -11139,9 +11164,74 @@ export function issueService(db: Db) {
               : {}),
           },
         );
+        let completionCoercion: {
+          requestedStatus: "done";
+          appliedStatus: "in_review";
+          reviewInteractionId: string;
+          reusedPendingReview: boolean;
+          message: string;
+        } | null = null;
+        if (completionCoerced && actorAgentId) {
+          const [pendingReview] = await tx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, updated.companyId),
+                eq(issueThreadInteractions.issueId, updated.id),
+                eq(issueThreadInteractions.status, "pending"),
+                sql`${issueThreadInteractions.payload}->'target'->>'key' = ${HUMAN_ONLY_COMPLETION_REVIEW_TARGET_KEY}`,
+              ),
+            )
+            .limit(1);
+          let reviewInteractionId = pendingReview?.id ?? null;
+          if (!reviewInteractionId) {
+            const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+            const card = await issueThreadInteractionService(tx).create(
+              updated,
+              buildHumanOnlyCompletionReviewInput({
+                runId: actorRunId,
+                addresseeUserId: updated.createdByUserId ?? updated.responsibleUserId ?? null,
+              }),
+              { systemId: HUMAN_ONLY_COMPLETION_REVIEW_SYSTEM_ID, runId: actorRunId ?? null },
+            );
+            reviewInteractionId = card.id;
+          }
+          completionCoercion = {
+            requestedStatus: "done",
+            appliedStatus: "in_review",
+            reviewInteractionId,
+            reusedPendingReview: Boolean(pendingReview),
+            message: HUMAN_ONLY_COMPLETION_COERCION_MESSAGE,
+          };
+          // Audit trail: which agent (and run) believes it finished.
+          await logActivity(
+            tx as unknown as Db,
+            {
+              companyId: updated.companyId,
+              actorType: "agent",
+              actorId: actorAgentId,
+              agentId: actorAgentId,
+              runId: actorRunId ?? null,
+              action: "issue.completion_coerced",
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                identifier: updated.identifier ?? null,
+                reviewPolicy: "human_only",
+                fromStatus: receiptExisting.status,
+                requestedStatus: completionCoercion.requestedStatus,
+                appliedStatus: completionCoercion.appliedStatus,
+                reviewInteractionId: completionCoercion.reviewInteractionId,
+                reusedPendingReview: completionCoercion.reusedPendingReview,
+              },
+            },
+            activityPublications,
+          );
+        }
         if (
-          (issueData.status === "done" || issueData.status === "cancelled") &&
-          existing.status !== issueData.status &&
+          (patch.status === "done" || patch.status === "cancelled") &&
+          existing.status !== patch.status &&
           existing.originKind ===
             RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation
         ) {
@@ -11205,6 +11295,7 @@ export function issueService(db: Db) {
             ? { blockedByIssueIds: nextBlockedByIssueIds }
             : {}),
           changes,
+          ...(completionCoercion ? { completionCoercion } : {}),
         };
       };
 

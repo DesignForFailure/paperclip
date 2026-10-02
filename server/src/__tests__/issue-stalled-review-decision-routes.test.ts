@@ -464,6 +464,52 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(done?.completedAt).toBeInstanceOf(Date);
   });
 
+  it("refuses an agent cancelling, hiding or deleting a human_only issue, before any side effect, and admits a user", async () => {
+    const seeded = await seedCompany("HOR");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HOR-1",
+      status: "in_progress",
+      reviewPolicy: "human_only",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const agentApp = app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId));
+    const refusal = { details: { code: "human_only_removal" } };
+
+    const cancel = await request(agentApp).patch(`/api/issues/${issueId}`).send({ status: "cancelled", comment: "Not needed." });
+    expect(cancel.status, JSON.stringify(cancel.body)).toBe(403);
+    expect(cancel.body).toMatchObject({ ...refusal, details: { removal: "cancel" } });
+    expect(cancel.body.error).toContain("/interactions");
+
+    const hide = await request(agentApp).patch(`/api/issues/${issueId}`).send({ hiddenAt: new Date().toISOString() });
+    expect(hide.status, JSON.stringify(hide.body)).toBe(403);
+    expect(hide.body).toMatchObject({ details: { removal: "hide" } });
+
+    const del = await request(agentApp).delete(`/api/issues/${issueId}`);
+    expect(del.status, JSON.stringify(del.body)).toBe(403);
+    expect(del.body).toMatchObject({ details: { removal: "delete" } });
+
+    const [row] = await db.select({ status: issues.status, hiddenAt: issues.hiddenAt }).from(issues).where(eq(issues.id, issueId));
+    expect(row).toEqual({ status: "in_progress", hiddenAt: null });
+    // Nothing happened on the way to the refusal: no comment, the run still runs.
+    expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+
+    // A person may still remove a human_only issue (one with no live run here: cancelling under a run writes run events).
+    const otherId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HOR-2",
+      status: "todo",
+      reviewPolicy: "human_only",
+    });
+    const byUser = await request(app(boardActor(seeded.companyId, seeded.memberUserId))).patch(`/api/issues/${otherId}`).send({ status: "cancelled" });
+    expect(byUser.status, JSON.stringify(byUser.body)).toBe(200);
+    expect(byUser.body.status).toBe("cancelled");
+  });
+
   it("still rejects an agent's bare in_review without a review path on a human_only issue", async () => {
     const seeded = await seedCompany("HIR");
     const issueId = await seedReview({

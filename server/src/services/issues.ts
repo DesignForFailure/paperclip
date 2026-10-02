@@ -199,6 +199,8 @@ import {
   HUMAN_ONLY_COMPLETION_REVIEW_SYSTEM_ID,
   HUMAN_ONLY_COMPLETION_REVIEW_TARGET_KEY,
   shouldCoerceAgentCompletionToReview,
+  agentRemovalOfHumanOnlyIssue,
+  humanOnlyRemovalRefused,
 } from "./issue-review-policy.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
@@ -10880,6 +10882,15 @@ export function issueService(db: Db) {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
         }
+        // Under the row lock: an agent may not take a human_only issue away
+        // (cancel or hide it); it has `blocked` for work it cannot finish.
+        const removal = agentRemovalOfHumanOnlyIssue({
+          issue: receiptExisting,
+          nextStatus: patch.status,
+          nextHiddenAt: patch.hiddenAt,
+          actorAgentId,
+        });
+        if (removal) throw humanOnlyRemovalRefused(removal);
         // Under the row lock: an agent's `done` on a human_only issue becomes
         // `in_review` with a human completion review (card created below).
         const completionCoerced = shouldCoerceAgentCompletionToReview({

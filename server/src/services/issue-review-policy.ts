@@ -177,6 +177,47 @@ export function shouldCoerceAgentCompletionToReview(input: {
   );
 }
 
+export type HumanOnlyRemoval = "cancel" | "hide" | "delete";
+
+/**
+ * `human_only` also reserves taking an issue away for a person. Cancelling,
+ * hiding and deleting each remove a board item with no review at all, which
+ * is the same bypass as an agent's own `done`: the work disappears and nobody
+ * was asked. An agent that cannot continue asks a person through an issue
+ * interaction and yields `in_review`, or sets `blocked`; both keep the issue
+ * visible and say why. Returns the removal an agent-attributed write
+ * would perform, or null. User and actorless (system, recovery) writes are
+ * never gated. Callers pass the row as it is before the write.
+ */
+export function agentRemovalOfHumanOnlyIssue(input: {
+  issue: { status: string; reviewPolicy?: IssueReviewPolicy | null; hiddenAt?: Date | string | null };
+  nextStatus?: unknown;
+  nextHiddenAt?: unknown;
+  deleting?: boolean;
+  actorAgentId: string | null | undefined;
+}): HumanOnlyRemoval | null {
+  if (!input.actorAgentId || input.issue.reviewPolicy !== "human_only") return null;
+  if (input.deleting === true) return "delete";
+  if (input.nextStatus === "cancelled" && input.issue.status !== "cancelled") return "cancel";
+  if (input.nextHiddenAt != null && input.issue.hiddenAt == null) return "hide";
+  return null;
+}
+
+const HUMAN_ONLY_REMOVAL_VERB: Record<HumanOnlyRemoval, string> = {
+  cancel: "cancelling",
+  hide: "hiding",
+  delete: "deleting",
+};
+
+/** 403: a policy refusal, not a state conflict; a retry cannot succeed. */
+export function humanOnlyRemovalRefused(removal: HumanOnlyRemoval) {
+  return forbidden(
+    `Review policy \`human_only\` reserves ${HUMAN_ONLY_REMOVAL_VERB[removal]} this issue for a person. ` +
+      "If a person must act before you can continue, ask with POST /api/issues/{issueId}/interactions (request_confirmation or ask_user_questions) and set status `in_review`. Do not retry.",
+    { code: "human_only_removal", removal, reviewPolicy: "human_only" },
+  );
+}
+
 /**
  * Each card gets its own target revision. Accepting a completion review only
  * sets `done` when no other card for the same revision is unresolved, so a

@@ -639,6 +639,17 @@ export {
 } from "./approval.js";
 
 export {
+  RUNTIME_FACT_DATA_MAX_BYTES,
+  RUNTIME_FACT_LIST_DEFAULT_LIMIT,
+  RUNTIME_FACT_LIST_MAX_LIMIT,
+  runtimeFactKeySchema,
+  runtimeFactKindSchema,
+  upsertRuntimeFactSchema,
+  type RuntimeFact,
+  type UpsertRuntimeFact,
+} from "./runtime-fact.js";
+
+export {
   envBindingPlainSchema,
   envBindingSecretRefSchema,
   envBindingUserSecretRefSchema,

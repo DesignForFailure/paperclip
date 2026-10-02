@@ -486,6 +486,8 @@ Decision-desk triage uses company-scoped sidecars rather than adding queue field
 - `decision_archive_notification_outbox` records one retry-safe origin-agent notification per source/archive version. The 90-day internal sweeper archives only unkept rows and coalesces delivery per origin agent.
 - Queue membership never grants source visibility. Item writes re-authorize the referenced source, and queue reads re-authorize every member before returning rows or counts.
 
+Runtime observation uses one company-scoped table, `runtime_facts` (`company_id`, `kind`, `key`, `data` jsonb, `observed_at`), unique on `(company_id, kind, key)`: facts about the runtimes that execute agents which are neither issues nor agents (see 10.7.1).
+
 ## 8. State Machines
 
 ## 8.1 Agent Status
@@ -1122,6 +1124,17 @@ Allowed states are `joined` and `left`. Endpoints require a concrete board user 
 - `POST /companies/:companyId/approvals`
 - `POST /approvals/:approvalId/approve`
 - `POST /approvals/:approvalId/reject`
+- `POST /approvals/:approvalId/cancel` (board only): withdraws an open approval without a board decision, when what it asked about was settled elsewhere. Sets `cancelled` with an optional `decisionNote`, logs `approval.cancelled`, runs no type side effect and wakes nobody. Idempotent: an already-resolved approval is returned unchanged.
+
+## 10.7.1 Runtime Facts
+
+Company-scoped facts about the runtimes that execute agents, written by an external observer (runtime reachability, model slots, runtime-native schedules and their runs). One row per `(company_id, kind, key)` in `runtime_facts`; `data` is the reporter's JSON (at most 64 KiB).
+
+- `GET /companies/:companyId/runtime-facts?kind=&limit=` (company access; default 200, max 1000 rows)
+- `PUT /companies/:companyId/runtime-facts/:kind/:key` with `{ data, observedAt? }` (board only): 201 on create, 200 otherwise. `updated_at` moves only when `data` changes; `observed_at` moves on every report.
+- `DELETE /companies/:companyId/runtime-facts/:kind/:key` (board only)
+
+A write is logged (`runtime_fact.created | updated | deleted`, entity type `runtime_fact`) and so announced on the company live channel only when the fact is created, changes or is removed: a reporter that repeats unchanged data does not grow the activity log.
 
 ## 10.8 Cost and Budgets
 

@@ -434,6 +434,36 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
+  // Withdraw an open approval without a board decision: the thing it asked about
+  // was settled elsewhere (for example a runtime prompt answered or expired in
+  // the runtime that raised it). Unlike reject it is not a human "no", triggers
+  // no type side effect (a rejected hire terminates its agent) and wakes nobody.
+  // Idempotent: an already-resolved approval is returned unchanged.
+  router.post("/approvals/:id/cancel", validate(resolveApprovalSchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await requireApprovalAccess(req, id);
+    if (!existing) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    const cancelled = await svc.cancel(id, req.body.decisionNote);
+    if (!cancelled) {
+      res.json(redactApprovalPayload(existing));
+      return;
+    }
+    await logActivity(db, {
+      companyId: cancelled.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "approval.cancelled",
+      entityType: "approval",
+      entityId: cancelled.id,
+      details: { type: cancelled.type },
+    });
+    res.json(redactApprovalPayload(cancelled));
+  });
+
   router.post(
     "/approvals/:id/request-revision",
     validate(requestApprovalRevisionSchema),

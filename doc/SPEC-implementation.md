@@ -272,6 +272,7 @@ Invariants:
 - task must trace to company goal chain via `goal_id`, `parent_id`, or project-goal linkage
 - `in_progress` requires assignee
 - an `in_review -> done | cancelled` verdict is authorized against the current review policy while the issue row is locked; a policy change in the same request or a concurrent request cannot relax that verdict gate
+- under `human_only`, an agent-attributed write that would cancel the issue (from any status), set `hiddenAt`, or delete it is refused with 403 `human_only_removal` before any side effect of the request, and again under the row lock in `issueService.update`; a cancel from `in_review` keeps the review-verdict refusal `review_policy_denied`. User writes and actorless service writes are not gated
 - under `human_only`, an agent-attributed move into `done` is decided against the row-locked policy and persists as `in_review` with a pending completion review; the issue update, the card and the `issue.completion_coerced` activity commit in one transaction
 - accepting or rejecting the review-confirmation interaction locks the issue row before resolving the interaction and reauthorizes against the current review policy in that transaction
 - accepting a fresh `request_confirmation` for the current issue's `plan` revision changes `work_mode = planning` to `work_mode = standard` in the same transaction as the accepted interaction; the existing agent-return transition also moves an eligible `in_review` issue to `todo` without changing its agent owner

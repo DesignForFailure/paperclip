@@ -7474,6 +7474,44 @@ describeEmbeddedPostgres("issueService.update human_only completion coercion", (
     },
   );
 
+  it.each(["backlog", "todo", "in_progress", "blocked", "in_review"] as const)(
+    "refuses an agent's %s -> cancelled on a human_only issue and leaves the row alone",
+    async (status) => {
+      const id = await seedIssue({ status });
+      await expect(svc.update(id, { status: "cancelled", actorAgentId: agentId })).rejects.toMatchObject({
+        status: 403,
+        details: { code: "human_only_removal", removal: "cancel" },
+      });
+      expect((await rowOf(id))?.status).toBe(status);
+    },
+  );
+
+  it("refuses an agent hiding a human_only issue", async () => {
+    const id = await seedIssue();
+    await expect(svc.update(id, { hiddenAt: new Date(), actorAgentId: agentId })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "human_only_removal", removal: "hide" },
+    });
+    const [row] = await db.select({ hiddenAt: issues.hiddenAt }).from(issues).where(eq(issues.id, id));
+    expect(row?.hiddenAt).toBeNull();
+  });
+
+  it("lets a user, and an actorless service write, cancel or hide a human_only issue", async () => {
+    const byUser = await seedIssue();
+    expect((await svc.update(byUser, { status: "cancelled", actorUserId: boardUserId }))?.status).toBe("cancelled");
+    const bySystem = await seedIssue();
+    expect((await svc.update(bySystem, { status: "cancelled" }))?.status).toBe("cancelled");
+    const hidden = await seedIssue();
+    expect((await svc.update(hidden, { hiddenAt: new Date(), actorUserId: boardUserId }))?.hiddenAt).toBeInstanceOf(Date);
+  });
+
+  it("lets an agent block a human_only issue, and cancel one that is not human_only", async () => {
+    const blocked = await seedIssue();
+    expect((await svc.update(blocked, { status: "blocked", actorAgentId: agentId }))?.status).toBe("blocked");
+    const own = await seedIssue({ reviewPolicy: null });
+    expect((await svc.update(own, { status: "cancelled", actorAgentId: agentId }))?.status).toBe("cancelled");
+  });
+
   it("treats an agent re-sending done on an already-done human_only issue as a no-op", async () => {
     const id = await seedIssue({ status: "done", completedAt: new Date() });
     const updated = await svc.update(id, { status: "done", actorAgentId: agentId });

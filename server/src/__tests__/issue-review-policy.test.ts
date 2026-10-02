@@ -8,6 +8,8 @@ import {
   buildHumanOnlyCompletionReviewInput,
   isIssueReviewVerdictInteraction,
   shouldCoerceAgentCompletionToReview,
+  agentRemovalOfHumanOnlyIssue,
+  humanOnlyRemovalRefused,
 } from "../services/issue-review-policy.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -294,5 +296,47 @@ describe("human_only completion coercion", () => {
     const first = buildHumanOnlyCompletionReviewInput({ runId, addresseeUserId: "board-user" });
     const second = buildHumanOnlyCompletionReviewInput({ runId, addresseeUserId: "board-user" });
     expect(first.payload.target.revisionId).not.toBe(second.payload.target.revisionId);
+  });
+});
+
+describe("human_only removal by an agent", () => {
+  const agentId = randomUUID();
+  const board = { status: "in_progress", reviewPolicy: "human_only", hiddenAt: null } as const;
+
+  it.each(["backlog", "todo", "in_progress", "blocked", "in_review", "done"] as const)(
+    "names an agent's %s -> cancelled a cancel",
+    (status) => {
+      expect(agentRemovalOfHumanOnlyIssue({ issue: { ...board, status }, nextStatus: "cancelled", actorAgentId: agentId })).toBe("cancel");
+    },
+  );
+
+  it("names setting hiddenAt a hide and a delete a delete", () => {
+    expect(agentRemovalOfHumanOnlyIssue({ issue: board, nextHiddenAt: new Date(), actorAgentId: agentId })).toBe("hide");
+    expect(agentRemovalOfHumanOnlyIssue({ issue: board, nextHiddenAt: "2026-10-02T00:00:00.000Z", actorAgentId: agentId })).toBe("hide");
+    expect(agentRemovalOfHumanOnlyIssue({ issue: board, deleting: true, actorAgentId: agentId })).toBe("delete");
+  });
+
+  it.each([
+    ["a user or system write", board, { nextStatus: "cancelled", actorAgentId: null }],
+    ["a user delete", board, { deleting: true, actorAgentId: undefined }],
+    ["an already-cancelled issue", { ...board, status: "cancelled" }, { nextStatus: "cancelled", actorAgentId: agentId }],
+    ["an already-hidden issue", { ...board, hiddenAt: new Date() }, { nextHiddenAt: new Date(), actorAgentId: agentId }],
+    ["un-hiding", { ...board, hiddenAt: new Date() }, { nextHiddenAt: null, actorAgentId: agentId }],
+    ["blocked, the agent's way out", board, { nextStatus: "blocked", actorAgentId: agentId }],
+    ["no status or hiddenAt in the write", board, { actorAgentId: agentId }],
+    ["reviewPolicy null", { ...board, reviewPolicy: null }, { nextStatus: "cancelled", actorAgentId: agentId }],
+    ["reviewPolicy anyone", { ...board, reviewPolicy: "anyone" }, { deleting: true, actorAgentId: agentId }],
+    ["reviewPolicy not_creator", { ...board, reviewPolicy: "not_creator" }, { nextHiddenAt: new Date(), actorAgentId: agentId }],
+  ] as const)("does not gate %s", (_label, issue, write) => {
+    expect(agentRemovalOfHumanOnlyIssue({ issue, ...write })).toBeNull();
+  });
+
+  it("refuses with 403 and tells the agent how to ask a person instead", () => {
+    const err = humanOnlyRemovalRefused("cancel");
+    expect(err.status).toBe(403);
+    expect(err.message).toContain("cancelling");
+    expect(err.message).toContain("/interactions");
+    expect(err.message).toContain("`in_review`");
+    expect(err.details).toEqual({ code: "human_only_removal", removal: "cancel", reviewPolicy: "human_only" });
   });
 });

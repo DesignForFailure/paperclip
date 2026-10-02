@@ -321,6 +321,8 @@ import {
   isIssueReviewVerdictInteraction,
   resolveIssueReviewRequester,
   shouldCoerceAgentCompletionToReview,
+  agentRemovalOfHumanOnlyIssue,
+  humanOnlyRemovalRefused,
 } from "../services/issue-review-policy.js";
 import {
   evaluateIssueThreadInteractionResolverAudience,
@@ -12909,6 +12911,18 @@ export function issueRoutes(
       const reviewPolicyChangeRequested =
         req.body.reviewPolicy !== undefined &&
         req.body.reviewPolicy !== existing.reviewPolicy;
+      // Refused before any side effect of the PATCH (run cancellation, runner
+      // goal stop, comments): an agent may not cancel or hide a human_only
+      // issue. The issue service checks again under the row lock.
+      // A cancel from `in_review` is a review verdict: the review policy
+      // check below gives that refusal, with its own code.
+      const humanOnlyRemoval = agentRemovalOfHumanOnlyIssue({
+        issue: existing,
+        nextStatus: existing.status === "in_review" ? undefined : updateFields.status,
+        nextHiddenAt: hiddenAtRaw,
+        actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
+      });
+      if (humanOnlyRemoval) throw humanOnlyRemovalRefused(humanOnlyRemoval);
       // An agent's `done` on a human_only issue is coerced to a completion
       // review below, not submitted as a verdict.
       const agentHumanOnlyCompletionRequested =
@@ -15069,6 +15083,13 @@ export function issueRoutes(
     );
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    // `svc.remove` takes no actor, so the human_only removal rule is applied here.
+    const humanOnlyRemoval = agentRemovalOfHumanOnlyIssue({
+      issue: existing,
+      deleting: true,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
+    });
+    if (humanOnlyRemoval) throw humanOnlyRemovalRefused(humanOnlyRemoval);
     const attachments = await svc.listAttachments(id);
 
     const issue = await svc.remove(id);

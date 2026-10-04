@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { runtimeFacts } from "@paperclipai/db";
 import { RUNTIME_FACT_LIST_DEFAULT_LIMIT, RUNTIME_FACT_LIST_MAX_LIMIT } from "@paperclipai/shared";
@@ -32,13 +32,30 @@ export function normalizeRuntimeFactLimit(value: unknown): number {
   return Math.min(Math.floor(parsed), RUNTIME_FACT_LIST_MAX_LIMIT);
 }
 
+/** Keyset cursor for the list: the (kind, key) of the last row of the previous page. */
+export interface RuntimeFactListCursor {
+  kind: string;
+  key: string;
+}
+
 export function runtimeFactService(db: Db) {
   return {
-    list: (companyId: string, opts: { kind?: string; limit?: number } = {}) =>
+    /**
+     * A company's facts in (kind, key) order. With `after`, only rows whose
+     * (kind, key) is strictly greater than the cursor: a row comparison, which
+     * the unique (company_id, kind, key) index serves as a range scan.
+     */
+    list: (companyId: string, opts: { kind?: string; limit?: number; after?: RuntimeFactListCursor } = {}) =>
       db
         .select()
         .from(runtimeFacts)
-        .where(opts.kind ? and(eq(runtimeFacts.companyId, companyId), eq(runtimeFacts.kind, opts.kind)) : eq(runtimeFacts.companyId, companyId))
+        .where(
+          and(
+            eq(runtimeFacts.companyId, companyId),
+            opts.kind ? eq(runtimeFacts.kind, opts.kind) : undefined,
+            opts.after ? sql`(${runtimeFacts.kind}, ${runtimeFacts.key}) > (${opts.after.kind}, ${opts.after.key})` : undefined,
+          ),
+        )
         .orderBy(asc(runtimeFacts.kind), asc(runtimeFacts.key))
         .limit(opts.limit ?? RUNTIME_FACT_LIST_DEFAULT_LIMIT),
 

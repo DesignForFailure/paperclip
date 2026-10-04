@@ -26,6 +26,25 @@ export function runtimeFactRoutes(db: Db) {
     return { kind: kind.data, key: key.data };
   }
 
+  /**
+   * The list's keyset cursor: `afterKind` and `afterKey` together, the (kind, key)
+   * of the last row of the previous page, or neither. An empty value counts as
+   * absent, as it does for `kind`.
+   */
+  function parseListCursor(query: Record<string, unknown>) {
+    const given = (value: unknown) => value !== undefined && value !== "";
+    if (!given(query.afterKind) && !given(query.afterKey)) return undefined;
+    if (!given(query.afterKind) || !given(query.afterKey)) throw badRequest("afterKind and afterKey must be given together");
+    if (typeof query.afterKind !== "string" || typeof query.afterKey !== "string") {
+      throw badRequest("afterKind and afterKey must each be given once");
+    }
+    const kind = runtimeFactKindSchema.safeParse(query.afterKind);
+    const key = runtimeFactKeySchema.safeParse(query.afterKey);
+    if (!kind.success) throw badRequest(`afterKind: ${kind.error.issues[0]?.message ?? "invalid kind"}`);
+    if (!key.success) throw badRequest(`afterKey: ${key.error.issues[0]?.message ?? "invalid key"}`);
+    return { kind: kind.data, key: key.data };
+  }
+
   router.get("/companies/:companyId/runtime-facts", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -35,7 +54,8 @@ export function runtimeFactRoutes(db: Db) {
       if (!parsed.success) throw badRequest(parsed.error.issues[0]?.message ?? "Invalid kind");
       kind = parsed.data;
     }
-    res.json(await svc.list(companyId, { kind, limit: normalizeRuntimeFactLimit(req.query.limit) }));
+    const after = parseListCursor(req.query);
+    res.json(await svc.list(companyId, { kind, limit: normalizeRuntimeFactLimit(req.query.limit), after }));
   });
 
   router.put("/companies/:companyId/runtime-facts/:kind/:key", validate(upsertRuntimeFactSchema), async (req, res) => {

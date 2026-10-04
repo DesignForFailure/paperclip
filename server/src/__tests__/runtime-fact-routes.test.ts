@@ -63,6 +63,29 @@ describe("runtime fact routes", () => {
     expect(mockRuntimeFactService.list).not.toHaveBeenCalled();
   });
 
+  it("passes a keyset cursor through to the list", async () => {
+    mockRuntimeFactService.list.mockResolvedValue([fact]);
+    const res = await request(createApp(agent)).get("/api/companies/company-1/runtime-facts?afterKind=model_slot&afterKey=a%2Fb&limit=2");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([fact]);
+    expect(mockRuntimeFactService.list).toHaveBeenCalledWith("company-1", { limit: 2, after: { kind: "model_slot", key: "a/b" } });
+  });
+
+  it("refuses half a cursor, a repeated cursor field and a malformed cursor kind", async () => {
+    const app = createApp(board);
+    const kindOnly = await request(app).get("/api/companies/company-1/runtime-facts?afterKind=runtime");
+    expect(kindOnly.status).toBe(400);
+    expect(kindOnly.body.error).toBe("afterKind and afterKey must be given together");
+    const keyOnly = await request(app).get("/api/companies/company-1/runtime-facts?afterKey=hermes&afterKind=");
+    expect(keyOnly.status).toBe(400);
+    expect(keyOnly.body.error).toBe("afterKind and afterKey must be given together");
+    expect((await request(app).get("/api/companies/company-1/runtime-facts?afterKind=a&afterKind=b&afterKey=x")).status).toBe(400);
+    const badKind = await request(app).get("/api/companies/company-1/runtime-facts?afterKind=Bad-Kind&afterKey=x");
+    expect(badKind.status).toBe(400);
+    expect(badKind.body.error).toMatch(/^afterKind: /);
+    expect(mockRuntimeFactService.list).not.toHaveBeenCalled();
+  });
+
   it("creates a fact with 201 and logs it", async () => {
     mockRuntimeFactService.upsert.mockResolvedValue({ fact, outcome: "created" });
     const res = await request(createApp(board))

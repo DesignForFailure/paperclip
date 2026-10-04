@@ -1131,7 +1131,7 @@ Allowed states are `joined` and `left`. Endpoints require a concrete board user 
 
 Company-scoped facts about the runtimes that execute agents, written by an external observer (runtime reachability, model slots, runtime-native schedules and their runs). One row per `(company_id, kind, key)` in `runtime_facts`; `data` is the reporter's JSON (at most 64 KiB).
 
-- `GET /companies/:companyId/runtime-facts?kind=&limit=` (company access; default 200, max 1000 rows)
+- `GET /companies/:companyId/runtime-facts?kind=&limit=&afterKind=&afterKey=` (company access; default 200, max 1000 rows, ordered by `(kind, key)`). Keyset paging: `afterKind` and `afterKey` together (else 400) return only rows whose `(kind, key)` is strictly greater; pass the last row of a full page to get the next, and stop at a short page.
 - `PUT /companies/:companyId/runtime-facts/:kind/:key` with `{ data, observedAt? }` (board only): 201 on create, 200 otherwise. `updated_at` moves only when `data` changes; `observed_at` moves on every report.
 - `DELETE /companies/:companyId/runtime-facts/:kind/:key` (board only)
 

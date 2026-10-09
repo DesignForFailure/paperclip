@@ -21,6 +21,8 @@ import { WebSocket } from "ws";
 
 type SessionKeyStrategy = "fixed" | "issue" | "run";
 
+type WakePromptMode = "cloud" | "paperclip";
+
 type WakePayload = {
   runId: string;
   agentId: string;
@@ -136,6 +138,10 @@ function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
   const normalized = asString(value, "issue").trim().toLowerCase();
   if (normalized === "fixed" || normalized === "run") return normalized;
   return "issue";
+}
+
+function normalizeWakePromptMode(value: unknown): WakePromptMode {
+  return asString(value, "cloud").trim().toLowerCase() === "paperclip" ? "paperclip" : "cloud";
 }
 
 function prefixSessionKeyForAgent(sessionKey: string, agentId: string | null): string {
@@ -472,6 +478,81 @@ function buildWakeText(
     "Complete the workflow in this run.",
   ];
   return lines.join("\n");
+}
+
+function buildCloudWakeText(ctx: AdapterExecutionContext, wakePayload: WakePayload): string {
+  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
+  // No heartbeat prompt template is sent over the gateway, so the wake prompt
+  // must carry the execution contract itself.
+  const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake, {
+    includeExecutionContract: true,
+    conversationMode: ctx.context.conversationMode === true,
+  });
+  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  return buildWakeText(
+    wakePayload,
+    paperclipEnv,
+    structuredWakeJson
+      ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
+      : structuredWakePrompt,
+    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
+    ctx.context.conversationMode === true
+      ? selectPaperclipTaskMarkdown(ctx.context, { resumedSession: Boolean(ctx.runtime?.sessionId), includeCommunicationGuidance: false })
+      : undefined,
+  );
+}
+
+// wakePrompt=paperclip: the wake prompt the Hermes gateway adapter builds
+// (hermes/src/gateway/server/execute.ts buildInput) for agents that record
+// their issue disposition through their own tools. It carries no Paperclip API
+// URL, claimed API key path, HTTP procedure, or execution contract, since each
+// of those directs the agent to the Paperclip API with a key.
+function buildPaperclipWakeText(ctx: AdapterExecutionContext, wakePayload: WakePayload): string {
+  // The communication guidance is prepended to the whole message in execute().
+  const taskMarkdown = nonEmpty(
+    selectPaperclipTaskMarkdown(ctx.context, {
+      resumedSession: Boolean(ctx.runtime?.sessionId),
+      includeCommunicationGuidance: false,
+    }),
+  );
+  const wakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake, {
+    conversationMode: ctx.context.conversationMode === true,
+    suppressIssueDescription: Boolean(taskMarkdown),
+  });
+  const wakePayloadJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake, {
+    omitIssueDescription: Boolean(taskMarkdown),
+  });
+  const sessionHandoff = nonEmpty(ctx.context.paperclipSessionHandoffMarkdown);
+  const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);
+  const lines = [
+    `You are ${ctx.agent.name}, an AI agent employee in a Paperclip-managed company.`,
+    "",
+    "Paperclip runtime identity:",
+    `- Agent ID: ${ctx.agent.id}`,
+    `- Company ID: ${ctx.agent.companyId}`,
+    `- Run ID: ${ctx.runId}`,
+    ...(wakePayload.taskId ? [`- Issue ID: ${wakePayload.taskId}`] : []),
+    ...(issueWorkMode ? [`- Issue work mode: ${issueWorkMode}`] : []),
+    ...(wakePayload.wakeReason ? [`- Wake reason: ${wakePayload.wakeReason}`] : []),
+    ...(wakePayload.wakeCommentId ? [`- Wake comment ID: ${wakePayload.wakeCommentId}`] : []),
+    ...(wakePayload.approvalId ? [`- Approval ID: ${wakePayload.approvalId}`] : []),
+    ...(wakePayload.approvalStatus ? [`- Approval status: ${wakePayload.approvalStatus}`] : []),
+    ...(wakePayload.issueIds.length > 0 ? [`- Linked issue IDs: ${wakePayload.issueIds.join(", ")}`] : []),
+    "",
+    wakePrompt,
+    ...(sessionHandoff ? ["", sessionHandoff] : []),
+    ...(taskMarkdown ? ["", taskMarkdown] : []),
+    ...(wakePayloadJson
+      ? [
+          "",
+          "Structured wake payload JSON:",
+          "```json",
+          wakePayloadJson,
+          "```",
+        ]
+      : []),
+  ];
+  return lines.join("\n").trim();
 }
 
 function appendWakeText(baseText: string, wakeText: string): string {
@@ -1103,25 +1184,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const disableDeviceAuth = parseBoolean(ctx.config.disableDeviceAuth, false);
 
   const wakePayload = buildWakePayload(ctx);
-  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
-  // No heartbeat prompt template is sent over the gateway, so the wake prompt
-  // must carry the execution contract itself.
-  const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake, {
-    includeExecutionContract: true,
-    conversationMode: ctx.context.conversationMode === true,
-  });
-  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
-  const wakeText = buildWakeText(
-    wakePayload,
-    paperclipEnv,
-    structuredWakeJson
-      ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
-      : structuredWakePrompt,
-    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
-    ctx.context.conversationMode === true
-      ? selectPaperclipTaskMarkdown(ctx.context, { resumedSession: Boolean(ctx.runtime?.sessionId), includeCommunicationGuidance: false })
-      : undefined,
-  );
+  const wakeText = normalizeWakePromptMode(ctx.config.wakePrompt) === "paperclip"
+    ? buildPaperclipWakeText(ctx, wakePayload)
+    : buildCloudWakeText(ctx, wakePayload);
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);

@@ -386,6 +386,19 @@ export function OpenClawGatewayConfigFields({
         </Field>
       )}
 
+      {!isCreate && (
+        <Field label="Wake prompt">
+          <select
+            value={eff("adapterConfig", "wakePrompt", String(config.wakePrompt ?? "cloud"))}
+            onChange={(e) => mark("adapterConfig", "wakePrompt", e.target.value)}
+            className={inputClass}
+          >
+            <option value="cloud">Cloud adapter procedure (Paperclip API key)</option>
+            <option value="paperclip">Paperclip wake payload only</option>
+          </select>
+        </Field>
+      )}
+
       <Field configSection="runPolicy" label="Wait timeout (ms)">
         <DraftInput
           value={

@@ -213,3 +213,103 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     expect(onDispatch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("openclaw_gateway wakePrompt", () => {
+  const claimedApiKeyPath = "/srv/openclaw/workspace/paperclip-claimed-api-key.json";
+  const paperclipApiUrl = "http://127.0.0.1:3100";
+
+  beforeEach(() => {
+    websocketState.connectionAttempts = 0;
+    websocketState.failConnectAttempts = 0;
+    websocketState.failAgentRequests = 0;
+    websocketState.events = [];
+    websocketState.messages = [];
+  });
+
+  function createWakeContext(config: Record<string, unknown> = {}): AdapterExecutionContext {
+    const ctx = createContext();
+    ctx.config = { ...ctx.config, paperclipApiUrl, claimedApiKeyPath, ...config };
+    ctx.context = {
+      issueId: "issue-1",
+      taskId: "issue-1",
+      wakeReason: "issue_assigned",
+      paperclipTaskMarkdown: 'Paperclip task context:\n- Issue: "PAP-7"\n- Title: "Copy the figures"',
+      paperclipWake: {
+        reason: "issue_assigned",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-7",
+          title: "Copy the figures",
+          description: "Copy 300, 4200 and 30F into a comment.",
+          status: "todo",
+        },
+      },
+    };
+    return ctx;
+  }
+
+  async function sentMessage(ctx: AdapterExecutionContext): Promise<string> {
+    websocketState.messages = [];
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+    expect(websocketState.messages).toHaveLength(1);
+    return websocketState.messages[0]!;
+  }
+
+  it.each([false, true])(
+    "sends the structured wake prompt without the API procedure or key (conversation=%s)",
+    async (conversationMode) => {
+      const ctx = createWakeContext({ wakePrompt: "paperclip" });
+      if (conversationMode) ctx.context = { ...ctx.context, conversationMode: true };
+      const message = await sentMessage(ctx);
+
+      expect(message).toContain("- Agent ID: agent-1");
+      expect(message).toContain("- Company ID: company-1");
+      expect(message).toContain("- Run ID: run-1");
+      expect(message).toContain("- Issue ID: issue-1");
+      expect(message).toContain("## Paperclip Wake Payload");
+      expect(message).toContain("- issue: PAP-7 Copy the figures");
+      expect(message).toContain('- Issue: "PAP-7"');
+      expect(message).toContain("Structured wake payload JSON:");
+      expect(message).toContain('"identifier":"PAP-7"');
+      for (const forbidden of [
+        "PAPERCLIP_API_KEY",
+        claimedApiKeyPath,
+        paperclipApiUrl,
+        "Authorization",
+        "X-Paperclip-Run-Id",
+        "/api/issues",
+        "curl",
+        "cloud adapter",
+        "Execution contract",
+      ]) {
+        expect(message).not.toContain(forbidden);
+      }
+    },
+  );
+
+  it("keeps the payloadTemplate message and the communication guidance around the paperclip wake prompt", async () => {
+    const ctx = createWakeContext({
+      wakePrompt: "paperclip",
+      payloadTemplate: { message: "Template preface." },
+    });
+    ctx.context = { ...ctx.context, paperclipTaskCommunicationGuidance: "## Communication in Slack" };
+    const message = await sentMessage(ctx);
+
+    expect(message.startsWith("## Communication in Slack\n\nTemplate preface.\n\nYou are OpenClaw Agent")).toBe(true);
+    expect(message.match(/## Communication in Slack/g)).toHaveLength(1);
+  });
+
+  it("sends the cloud adapter procedure when wakePrompt is unset, cloud, or unrecognised", async () => {
+    const unset = await sentMessage(createWakeContext());
+    expect(unset.startsWith("Paperclip wake event for a cloud adapter.")).toBe(true);
+    expect(unset).toContain(`Load PAPERCLIP_API_KEY from ${claimedApiKeyPath}`);
+    expect(unset).toContain(`PAPERCLIP_API_URL=${paperclipApiUrl}/`);
+    expect(unset).toContain("- Use Authorization: Bearer $PAPERCLIP_API_KEY on every API call.");
+    expect(unset).toContain("POST /api/issues/{issueId}/checkout");
+    expect(unset).toContain("Execution contract:");
+
+    expect(await sentMessage(createWakeContext({ wakePrompt: "cloud" }))).toBe(unset);
+    expect(await sentMessage(createWakeContext({ wakePrompt: "something-else" }))).toBe(unset);
+  });
+});

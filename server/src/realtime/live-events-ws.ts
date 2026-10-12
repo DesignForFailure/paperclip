@@ -8,6 +8,7 @@ import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipa
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
+import { boardAuthService } from "../services/board-auth.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 interface WsSocket {
@@ -199,6 +200,26 @@ async function authorizeUpgrade(
       actorType: "board",
       actorId: userId,
     };
+  }
+
+  // A board API key (`pcp_board_…`) is the board's own credential on every HTTP route, tried there before an agent
+  // key (middleware/auth.ts). The socket takes it the same way, from the Authorization header only (a key in a URL
+  // ends up in logs), and scopes it as it scopes a session user: an instance admin, or an active member of the company.
+  if (authToken) {
+    const boardAuth = boardAuthService(db);
+    const boardKey = await boardAuth.findBoardApiKeyByToken(authToken);
+    if (boardKey) {
+      const access = await boardAuth.resolveBoardAccess(boardKey.userId);
+      if (access.user) {
+        if (!access.isInstanceAdmin && !access.companyIds.includes(companyId)) return null;
+        await boardAuth.touchBoardApiKey(boardKey.id);
+        return {
+          companyId,
+          actorType: "board",
+          actorId: boardKey.userId,
+        };
+      }
+    }
   }
 
   const tokenHash = hashToken(token);

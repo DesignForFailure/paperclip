@@ -12,6 +12,21 @@ vi.mock("../middleware/logger.js", () => ({
   },
 }));
 
+const boardAuth = vi.hoisted(() => ({
+  findBoardApiKeyByToken: vi.fn(),
+  resolveBoardAccess: vi.fn(),
+  touchBoardApiKey: vi.fn(),
+}));
+
+vi.mock("../services/board-auth.js", () => ({
+  boardAuthService: () => boardAuth,
+}));
+
+/** A database whose agent-key lookup finds nothing: a token that is no board key is then refused. */
+const noAgentKeys = {
+  select: () => ({ from: () => ({ where: () => Promise.resolve([]) }) }),
+};
+
 class FakeUpgradeSocket extends EventEmitter {
   destroyed = false;
   writable = true;
@@ -179,5 +194,98 @@ describe("setupLiveEventsWebSocketServer", () => {
 
     expect(resolveSessionFromHeaders).toHaveBeenCalledTimes(1);
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
+  });
+
+  describe("board API keys", () => {
+    const bearer = (token: string) => createUpgradeRequest({ headers: { authorization: `Bearer ${token}` } });
+
+    async function upgrade(req: IncomingMessage, socket: FakeUpgradeSocket, deploymentMode: "authenticated" | "local_trusted" = "authenticated") {
+      const server = new EventEmitter();
+      const resolveSessionFromHeaders = vi.fn(async () => null);
+      setupLiveEventsWebSocketServer(server as never, noAgentKeys as never, { deploymentMode, resolveSessionFromHeaders });
+      server.emit("upgrade", req, socket as unknown as Duplex, Buffer.alloc(0));
+      await flushPromises();
+      await flushPromises();
+      return { resolveSessionFromHeaders };
+    }
+
+    function grant(access: { user: boolean; isInstanceAdmin: boolean; companyIds: string[] }, socket: FakeUpgradeSocket) {
+      boardAuth.findBoardApiKeyByToken.mockResolvedValue({ id: "key-1", userId: "user-1" });
+      boardAuth.resolveBoardAccess.mockImplementation(async () => {
+        // Stop before the ws handshake writes to the fake socket; a pass is the absence of a rejection.
+        socket.writable = false;
+        return { user: access.user ? { id: "user-1" } : null, isInstanceAdmin: access.isInstanceAdmin, companyIds: access.companyIds, memberships: [] };
+      });
+    }
+
+    it("authorizes an instance admin's board key for any company, without a session", async () => {
+      const socket = new FakeUpgradeSocket();
+      grant({ user: true, isInstanceAdmin: true, companyIds: [] }, socket);
+      const { resolveSessionFromHeaders } = await upgrade(bearer("pcp_board_admin"), socket);
+
+      expect(socket.endedChunks).toEqual([]);
+      expect(boardAuth.findBoardApiKeyByToken).toHaveBeenCalledWith("pcp_board_admin");
+      expect(boardAuth.resolveBoardAccess).toHaveBeenCalledWith("user-1");
+      expect(boardAuth.touchBoardApiKey).toHaveBeenCalledWith("key-1");
+      expect(resolveSessionFromHeaders).not.toHaveBeenCalled();
+    });
+
+    it("authorizes a member's board key for a company it belongs to", async () => {
+      const socket = new FakeUpgradeSocket();
+      grant({ user: true, isInstanceAdmin: false, companyIds: ["company-1"] }, socket);
+      await upgrade(bearer("pcp_board_member"), socket);
+
+      expect(socket.endedChunks).toEqual([]);
+    });
+
+    it("rejects a board key for a company its user is not a member of", async () => {
+      const socket = new FakeUpgradeSocket();
+      grant({ user: true, isInstanceAdmin: false, companyIds: ["company-other"] }, socket);
+      socket.writable = true;
+      boardAuth.resolveBoardAccess.mockResolvedValue({ user: { id: "user-1" }, isInstanceAdmin: false, companyIds: ["company-other"], memberships: [] });
+      await upgrade(bearer("pcp_board_outsider"), socket);
+
+      expect(socket.endedChunks[0]).toContain("403 Forbidden");
+      expect(boardAuth.touchBoardApiKey).not.toHaveBeenCalled();
+    });
+
+    it("rejects a board key whose user is gone", async () => {
+      const socket = new FakeUpgradeSocket();
+      boardAuth.findBoardApiKeyByToken.mockResolvedValue({ id: "key-1", userId: "user-gone" });
+      boardAuth.resolveBoardAccess.mockResolvedValue({ user: null, isInstanceAdmin: false, companyIds: [], memberships: [] });
+      await upgrade(bearer("pcp_board_orphan"), socket);
+
+      expect(socket.endedChunks[0]).toContain("403 Forbidden");
+      expect(boardAuth.touchBoardApiKey).not.toHaveBeenCalled();
+    });
+
+    it("rejects a token that is neither a board key nor an agent key", async () => {
+      const socket = new FakeUpgradeSocket();
+      boardAuth.findBoardApiKeyByToken.mockResolvedValue(null);
+      await upgrade(bearer("pcp_board_unknown"), socket);
+
+      expect(socket.endedChunks[0]).toContain("403 Forbidden");
+      expect(boardAuth.resolveBoardAccess).not.toHaveBeenCalled();
+    });
+
+    it("never takes a board key from the query string, where it would be logged", async () => {
+      const socket = new FakeUpgradeSocket();
+      grant({ user: true, isInstanceAdmin: true, companyIds: [] }, socket);
+      socket.writable = true;
+      boardAuth.resolveBoardAccess.mockResolvedValue({ user: { id: "user-1" }, isInstanceAdmin: true, companyIds: [], memberships: [] });
+      await upgrade(createUpgradeRequest({ url: "/api/companies/company-1/events/ws?token=pcp_board_admin" }), socket);
+
+      expect(boardAuth.findBoardApiKeyByToken).not.toHaveBeenCalled();
+      expect(socket.endedChunks[0]).toContain("403 Forbidden");
+    });
+
+    it("authorizes a board key under local_trusted as well, as the HTTP routes do", async () => {
+      const socket = new FakeUpgradeSocket();
+      grant({ user: true, isInstanceAdmin: true, companyIds: [] }, socket);
+      await upgrade(bearer("pcp_board_admin"), socket, "local_trusted");
+
+      expect(socket.endedChunks).toEqual([]);
+      expect(boardAuth.findBoardApiKeyByToken).toHaveBeenCalledWith("pcp_board_admin");
+    });
   });
 });

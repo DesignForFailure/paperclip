@@ -128,6 +128,7 @@ async function authorizeUpgrade(
   companyId: string,
   url: URL,
   opts: {
+    boardAuth: ReturnType<typeof boardAuthService>;
     deploymentMode: DeploymentMode;
     resolveSessionFromHeaders?: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
     resolveCloudActor?: (req: IncomingMessage) => Promise<CloudUpgradeActor | null>;
@@ -206,7 +207,7 @@ async function authorizeUpgrade(
   // key (middleware/auth.ts). The socket takes it the same way, from the Authorization header only (a key in a URL
   // ends up in logs), and scopes it as it scopes a session user: an instance admin, or an active member of the company.
   if (authToken) {
-    const boardAuth = boardAuthService(db);
+    const { boardAuth } = opts;
     const boardKey = await boardAuth.findBoardApiKeyByToken(authToken);
     if (boardKey) {
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
@@ -260,6 +261,9 @@ export function setupLiveEventsWebSocketServer(
   },
 ) {
   const wss = new WebSocketServer({ noServer: true });
+  // One service for every upgrade, as actorMiddleware keeps one: its debounce of a board key's lastUsedAt write is
+  // per instance, so a socket that keeps reconnecting writes once a minute, not on every handshake.
+  const boardAuth = boardAuthService(db);
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
 
@@ -338,6 +342,7 @@ export function setupLiveEventsWebSocketServer(
     }
 
     void authorizeUpgrade(db, req, companyId, url, {
+      boardAuth,
       deploymentMode: opts.deploymentMode,
       resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
       resolveCloudActor: opts.resolveCloudActor,

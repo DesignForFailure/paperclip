@@ -18,8 +18,10 @@ const boardAuth = vi.hoisted(() => ({
   touchBoardApiKey: vi.fn(),
 }));
 
+const boardAuthService = vi.hoisted(() => vi.fn(() => boardAuth));
+
 vi.mock("../services/board-auth.js", () => ({
-  boardAuthService: () => boardAuth,
+  boardAuthService,
 }));
 
 /** A database whose agent-key lookup finds nothing: a token that is no board key is then refused. */
@@ -277,6 +279,22 @@ describe("setupLiveEventsWebSocketServer", () => {
 
       expect(boardAuth.findBoardApiKeyByToken).not.toHaveBeenCalled();
       expect(socket.endedChunks[0]).toContain("403 Forbidden");
+    });
+
+    it("keeps one board-auth service for every upgrade, so its lastUsedAt debounce holds across reconnects", async () => {
+      const server = new EventEmitter();
+      setupLiveEventsWebSocketServer(server as never, noAgentKeys as never, { deploymentMode: "authenticated" });
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const socket = new FakeUpgradeSocket();
+        grant({ user: true, isInstanceAdmin: true, companyIds: [] }, socket);
+        server.emit("upgrade", bearer("pcp_board_admin"), socket as unknown as Duplex, Buffer.alloc(0));
+        await flushPromises();
+        await flushPromises();
+        expect(socket.endedChunks).toEqual([]);
+      }
+
+      expect(boardAuthService).toHaveBeenCalledTimes(1);
+      expect(boardAuth.touchBoardApiKey).toHaveBeenCalledTimes(3);
     });
 
     it("authorizes a board key under local_trusted as well, as the HTTP routes do", async () => {

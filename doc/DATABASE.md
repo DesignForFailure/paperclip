@@ -33,7 +33,8 @@ By default the embedded cluster's role `paperclip` has the password `paperclip`,
 
 - **The file:** the server makes it when it is absent: a random password, mode 0600, in a folder made 0700. A file others can read, or an empty one, is refused.
 - **A new cluster** is initialised with that password.
-- **A cluster made before the file** is given the password once. On its next start the server (or `pnpm db:migrate`) reaches it with the fixed password, checks that its data directory is this instance's, and changes the role's password. From then on `paperclip` no longer opens it.
+- **A cluster made before the file** is given the password once, when the server (or `pnpm db:migrate`, or a CLI command that starts the cluster) next starts it. First it starts the cluster with no TCP listener and its socket in a new private folder, so no other process can use the fixed password meanwhile. It changes the role's password there, stops the cluster, and then starts it as usual. From then on `paperclip` no longer opens it. A digest of the password, `paperclip-role-password.sha256` in the data directory, records that this is done.
+- **A cluster that is already running** with the fixed password is never changed over TCP: the server refuses to use it. Stop it and start the server again.
 - **The same setting is needed** wherever a command opens that database: the CLI's `db:backup`, `routines`, `auth bootstrap-ceo` and `worktree` commands, and the maintenance scripts. Every one reads the variable, or the instance's `.env`.
 - **Worktrees:** `paperclipai worktree init` from an instance that uses a password file gives the worktree a file of its own in the worktree's `secrets/` folder, recorded in its `.env`.
 - **Keep the file:** it holds the only copy of the password. If it's removed, the server makes a new one, the database refuses it, and the server stops with that error until the file is put back.

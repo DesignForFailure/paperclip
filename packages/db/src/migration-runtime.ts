@@ -5,7 +5,9 @@ import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import {
-  adoptEmbeddedPostgresPassword,
+  EmbeddedPostgresFixedPasswordError,
+  adoptEmbeddedPostgresPasswordPrivately,
+  checkEmbeddedPostgresPassword,
   embeddedPostgresPassword,
   embeddedPostgresUrl,
 } from "./embedded-postgres-password.js";
@@ -24,6 +26,7 @@ type EmbeddedPostgresCtor = new (opts: {
   port: number;
   persistent: boolean;
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -109,7 +112,7 @@ async function ensureEmbeddedPostgresConnection(
 
   if (!runningPid && existsSync(pgVersionFile)) {
     try {
-      await adoptEmbeddedPostgresPassword(preferredPort, dataDir);
+      await checkEmbeddedPostgresPassword(preferredPort, dataDir);
       const actualDataDir = await getPostgresDataDirectory(preferredAdminConnectionString);
       const matchesDataDir =
         typeof actualDataDir === "string" &&
@@ -126,14 +129,16 @@ async function ensureEmbeddedPostgresConnection(
         source: `embedded-postgres@${preferredPort}`,
         stop: async () => {},
       };
-    } catch {
+    } catch (error) {
+      // A running cluster that still has the fixed password is not started again beside it.
+      if (error instanceof EmbeddedPostgresFixedPasswordError) throw error;
       // Fall through and attempt to start the configured embedded cluster.
     }
   }
 
   if (runningPid) {
     const port = runningPort ?? preferredPort;
-    await adoptEmbeddedPostgresPassword(port, dataDir);
+    await checkEmbeddedPostgresPassword(port, dataDir);
     const adminConnectionString = embeddedPostgresUrl(port, "postgres");
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     return {
@@ -143,16 +148,18 @@ async function ensureEmbeddedPostgresConnection(
     };
   }
 
-  const instance = new EmbeddedPostgres({
+  const createInstance = (postgresFlags: string[] = []) => new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
     password: embeddedPostgresPassword(),
     port: selectedPort,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+    postgresFlags,
     onLog: logBuffer.append,
     onError: logBuffer.append,
   });
+  const instance = createInstance();
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
     try {
@@ -168,6 +175,8 @@ async function ensureEmbeddedPostgresConnection(
   if (existsSync(postmasterPidFile)) {
     rmSync(postmasterPidFile, { force: true });
   }
+  // A cluster made before the configured password file is given its password with no TCP listener first.
+  await adoptEmbeddedPostgresPasswordPrivately({ dataDir, port: selectedPort, createInstance });
   try {
     await instance.start();
   } catch (error) {
@@ -177,7 +186,7 @@ async function ensureEmbeddedPostgresConnection(
     });
   }
 
-  await adoptEmbeddedPostgresPassword(selectedPort, dataDir);
+  await checkEmbeddedPostgresPassword(selectedPort, dataDir);
   const adminConnectionString = embeddedPostgresUrl(selectedPort, "postgres");
   await ensurePostgresDatabase(adminConnectionString, "paperclip");
 

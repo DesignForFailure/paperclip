@@ -67,7 +67,8 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   embeddedPostgresUrl,
   embeddedPostgresPassword,
-  adoptEmbeddedPostgresPassword,
+  adoptEmbeddedPostgresPasswordPrivately,
+  checkEmbeddedPostgresPassword,
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
 } from "@paperclipai/db";
 import type { Command } from "commander";
@@ -199,6 +200,7 @@ type EmbeddedPostgresCtor = new (opts: {
   port: number;
   persistent: boolean;
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -1149,8 +1151,8 @@ export async function ensureEmbeddedPostgres(
       );
     }
     const port = readPidFilePort(postmasterPidFile) ?? preferredPort;
-    // A cluster made before its instance's password file is given that password once (the fork's O-96).
-    await adoptEmbeddedPostgresPassword(port, dataDir, passwordEnv);
+    // The password file is only checked here: a running cluster's password is never changed over TCP (the fork's O-96).
+    await checkEmbeddedPostgresPassword(port, dataDir, passwordEnv);
     return {
       port,
       password,
@@ -1161,16 +1163,18 @@ export async function ensureEmbeddedPostgres(
 
   const port = await findAvailablePort(preferredPort);
   const logBuffer = createEmbeddedPostgresLogBuffer();
-  const instance = new EmbeddedPostgres({
+  const createInstance = (postgresFlags: string[] = []) => new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
     password,
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+    postgresFlags,
     onLog: logBuffer.append,
     onError: logBuffer.append,
   });
+  const instance = createInstance();
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
     try {
@@ -1185,6 +1189,8 @@ export async function ensureEmbeddedPostgres(
   if (existsSync(postmasterPidFile)) {
     rmSync(postmasterPidFile, { force: true });
   }
+  // A cluster made before the password file is given its password with no TCP listener first (the fork's O-96).
+  await adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance, env: passwordEnv });
   try {
     await instance.start();
   } catch (error) {
@@ -1195,7 +1201,7 @@ export async function ensureEmbeddedPostgres(
   }
 
   try {
-    await adoptEmbeddedPostgresPassword(port, dataDir, passwordEnv);
+    await checkEmbeddedPostgresPassword(port, dataDir, passwordEnv);
   } catch (error) {
     await instance.stop();
     throw error;

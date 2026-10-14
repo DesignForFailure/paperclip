@@ -7,7 +7,9 @@ import {
   heartbeatRuns,
   instanceUserRoles,
   issueComments,
+  issueLabels,
   issues,
+  labels,
   principalPermissionGrants,
   projects,
   userInboxAgentPolicies,
@@ -15,6 +17,7 @@ import {
 import type {
   AgentApiKeyScope,
   InboxAgentPolicyMode,
+  OwnIssuesAgentKeyScope,
   PermissionKey,
   PrincipalType,
   SkillTestAgentKeyScope,
@@ -1218,6 +1221,49 @@ export function authorizationService(db: Db | DbTransaction) {
     return denyBridge("Task bridge key cannot use this API action.");
   }
 
+  /**
+   * An own-issues key (the commands an agent runs on its own): only the issues assigned to its agent, and none of
+   * those it may change when a label begins with one of the scope's denied prefixes. Returns a denial, or null to go on
+   * deciding as for the agent's standard key: the scope only narrows.
+   */
+  async function decideOwnIssuesAccess(input: {
+    actorAgentId: string;
+    action: AuthorizationAction;
+    resource: AuthorizationResource;
+    scope: OwnIssuesAgentKeyScope;
+  }): Promise<AuthorizationDecision | null> {
+    const denyOwn = (explanation: string) =>
+      deny({
+        action: input.action,
+        reason: "deny_scope",
+        explanation,
+      });
+    if (input.action !== "issue:read" && input.action !== "issue:comment" && input.action !== "issue:mutate") {
+      return denyOwn("Own-issues keys can only read, comment on and change their agent's own issues.");
+    }
+    if (input.resource.type !== "issue" || !input.resource.issueId) {
+      return denyOwn("Own-issues key access requires an issue resource.");
+    }
+    const issue = await loadIssue(input.resource.issueId);
+    if (!issue || issue.assigneeAgentId !== input.actorAgentId) {
+      return denyOwn("Own-issues key can only access issues assigned to its agent.");
+    }
+    const prefixes = input.scope.deniedLabelPrefixes ?? [];
+    if (input.action === "issue:mutate" && prefixes.length > 0) {
+      const names = await db
+        .select({ name: labels.name })
+        .from(issueLabels)
+        .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+        .where(eq(issueLabels.issueId, issue.id))
+        .then((rows) => rows.map((row) => row.name));
+      const held = names.find((name) => prefixes.some((prefix) => name.toLowerCase().startsWith(prefix.toLowerCase())));
+      if (held !== undefined) {
+        return denyOwn(`Own-issues key cannot change an issue labelled ${held}: it is finished through its runtime's own key.`);
+      }
+    }
+    return null;
+  }
+
   function decideSkillTestAccess(input: {
     action: AuthorizationAction;
     resource: AuthorizationResource;
@@ -1879,6 +1925,16 @@ export function authorizationService(db: Db | DbTransaction) {
         scope: input.actor.keyScope,
       });
       if (skillTestDecision) return skillTestDecision;
+    }
+
+    if (input.actor.keyScope?.kind === "own_issues") {
+      const ownIssuesDecision = await decideOwnIssuesAccess({
+        actorAgentId,
+        action: input.action,
+        resource: input.resource,
+        scope: input.actor.keyScope,
+      });
+      if (ownIssuesDecision) return ownIssuesDecision;
     }
 
     if (input.actor.keyScope?.kind === "task_bridge") {

@@ -9,7 +9,9 @@ import {
   createDb,
   instanceUserRoles,
   issueComments,
+  issueLabels,
   issues,
+  labels,
   principalPermissionGrants,
   projects,
   userInboxAgentPolicies,
@@ -178,6 +180,8 @@ describeEmbeddedPostgres("authorization service", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(instanceUserRoles);
+    await db.delete(issueLabels);
+    await db.delete(labels);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(projects);
@@ -2732,5 +2736,51 @@ describeEmbeddedPostgres("authorization service", () => {
       await expect(authz.decide({ actor, action: "secrets:propose", resource }))
         .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
     }
+  });
+
+  it("keeps an own-issues key to its agent's issues, and from changing one whose label it is told to leave", async () => {
+    const company = await createCompany(db, "OwnIssuesKey");
+    const actorAgent = await createAgent(db, company.id);
+    const peerAgent = await createAgent(db, company.id);
+    const own = await createIssue(db, company.id, { assigneeAgentId: actorAgent.id });
+    const gated = await createIssue(db, company.id, { assigneeAgentId: actorAgent.id });
+    const peers = await createIssue(db, company.id, { assigneeAgentId: peerAgent.id });
+    const label = await db.insert(labels).values({ companyId: company.id, name: "skill:code-change", color: "#7b8794" })
+      .returning().then((rows) => rows[0]!);
+    await db.insert(issueLabels).values({ issueId: gated.id, labelId: label.id, companyId: company.id });
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+      keyScope: { kind: "own_issues" as const, deniedLabelPrefixes: ["Skill:"] },
+    };
+    const on = (issue: { id: string; assigneeAgentId: string | null; status: string }) => ({
+      type: "issue" as const,
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: issue.assigneeAgentId,
+      status: issue.status,
+    });
+    const authz = authorizationService(db);
+
+    // Its own issue: decided as the standard key decides it.
+    for (const action of ["issue:read", "issue:comment", "issue:mutate"] as const) {
+      await expect(authz.decide({ actor, action, resource: on(own) })).resolves.toMatchObject({ allowed: true });
+    }
+    // A peer's issue, which the standard key could comment on and change: not this key.
+    for (const action of ["issue:read", "issue:comment", "issue:mutate"] as const) {
+      await expect(authz.decide({ actor, action, resource: on(peers) }))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    }
+    // Its own issue that a gate finishes (the prefix matched whatever its case): read and commented on, never changed.
+    await expect(authz.decide({ actor, action: "issue:comment", resource: on(gated) })).resolves.toMatchObject({ allowed: true });
+    await expect(authz.decide({ actor, action: "issue:mutate", resource: on(gated) }))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    // Nothing beyond issues: no task made, no agent, project or company read.
+    await expect(authz.decide({ actor, action: "tasks:assign", resource: on(own) }))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    await expect(authz.decide({ actor, action: "company_scope:read", resource: { type: "company" as const, companyId: company.id } }))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
   });
 });

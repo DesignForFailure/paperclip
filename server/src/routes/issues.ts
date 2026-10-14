@@ -8393,12 +8393,21 @@ export function issueRoutes(
     res.json(result);
   });
 
+  // An own-issues key (the commands an agent runs on its own) makes and deletes no label: a label deleted is taken off
+  // every issue it marks, one a gate finishes included.
+  const refuseOwnIssuesKey = (req: Request, res: Response): boolean => {
+    if (req.actor.type !== "agent" || req.actor.keyScope?.kind !== "own_issues") return false;
+    res.status(403).json({ error: "An own-issues key makes and deletes no label" });
+    return true;
+  };
+
   router.post(
     "/companies/:companyId/labels",
     validate(createIssueLabelSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      if (refuseOwnIssuesKey(req, res)) return;
       const label = await svc.createLabel(companyId, req.body);
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -8418,6 +8427,7 @@ export function issueRoutes(
   );
 
   router.delete("/labels/:labelId", async (req, res) => {
+    if (refuseOwnIssuesKey(req, res)) return;
     const labelId = req.params.labelId as string;
     const existing = await getAccessibleResource(
       req,

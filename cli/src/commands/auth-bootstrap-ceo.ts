@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { and, eq, gt, isNull } from "drizzle-orm";
-import { createDb, instanceUserRoles, invites } from "@paperclipai/db";
+import { createDb, instanceUserRoles, invites, embeddedPostgresUrl } from "@paperclipai/db";
 import { inferBindModeFromHost } from "@paperclipai/shared";
 import { loadPaperclipEnvFile } from "../config/env.js";
 import { readConfig, resolveConfigPath } from "../config/store.js";
@@ -24,7 +24,7 @@ function resolveDbUrl(configPath?: string, explicitDbUrl?: string) {
   }
   if (config?.database.mode === "embedded-postgres") {
     const port = config.database.embeddedPostgresPort ?? 54329;
-    return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    return embeddedPostgresUrl(port, "paperclip");
   }
   return null;
 }

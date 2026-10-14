@@ -11,6 +11,8 @@ import {
   formatEmbeddedPostgresError,
   prepareEmbeddedPostgresNativeRuntime,
   routines,
+  embeddedPostgresUrl,
+  embeddedPostgresPassword,
 } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
 import { loadPaperclipEnvFile } from "../config/env.js";
@@ -134,7 +136,7 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password: "paperclip",
+    password: embeddedPostgresPassword(),
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
@@ -195,9 +197,9 @@ async function openConfiguredDb(configPath: string): Promise<{
         config.database.embeddedPostgresDataDir,
         config.database.embeddedPostgresPort,
       );
-      const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/postgres`;
+      const adminConnectionString = embeddedPostgresUrl(embeddedHandle.port, "postgres");
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
-      const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/paperclip`;
+      const connectionString = embeddedPostgresUrl(embeddedHandle.port, "paperclip");
       await applyPendingMigrations(connectionString);
       const db = createDb(connectionString) as ClosableDb;
       return {
@@ -258,9 +260,9 @@ export async function disableAllRoutinesInConfig(
         config.database.embeddedPostgresDataDir,
         config.database.embeddedPostgresPort,
       );
-      const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/postgres`;
+      const adminConnectionString = embeddedPostgresUrl(embeddedHandle.port, "postgres");
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
-      const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/paperclip`;
+      const connectionString = embeddedPostgresUrl(embeddedHandle.port, "paperclip");
       await applyPendingMigrations(connectionString);
       db = createDb(connectionString) as ClosableDb;
     } else {

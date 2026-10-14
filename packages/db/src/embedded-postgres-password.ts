@@ -159,8 +159,8 @@ export class EmbeddedPostgresFixedPasswordError extends Error {
 /**
  * The embedded cluster on PORT, whose data directory is DATA_DIR, takes the configured password, checked over TCP and
  * never changed there. `unchanged` when no file is configured or the role has the file's password; throws
- * EmbeddedPostgresFixedPasswordError when the role still has the fixed one, and an error when neither opens it or
- * nothing answers.
+ * EmbeddedPostgresFixedPasswordError when DATA_DIR's cluster still has the fixed one, and another error when the fixed
+ * one opens another PostgreSQL, when neither opens it, or when nothing answers.
  */
 export async function checkEmbeddedPostgresPassword(
   port: number,
@@ -176,7 +176,14 @@ export async function checkEmbeddedPostgresPassword(
   }
   if (current.result === "unreachable") throw current.error;
   const legacy = await probe({ port }, LEGACY_EMBEDDED_POSTGRES_PASSWORD);
-  if (legacy.result === "ok") throw new EmbeddedPostgresFixedPasswordError(port);
+  if (legacy.result === "ok") {
+    // Only this instance's cluster is the one to stop and start again; another PostgreSQL on the port is not it, and a
+    // caller may go on to a free port (Codex, paperclip#9).
+    if (typeof legacy.dataDirectory === "string" && path.resolve(legacy.dataDirectory) === path.resolve(dataDir)) {
+      throw new EmbeddedPostgresFixedPasswordError(port);
+    }
+    throw new Error(`The PostgreSQL on port ${port} is not the embedded cluster of ${dataDir}`);
+  }
   throw new Error(
     `The embedded PostgreSQL role on port ${port} takes neither the password in ${passwordFile(env)} nor the fixed one`,
   );

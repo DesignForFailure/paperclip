@@ -203,6 +203,10 @@ describePostgres("the embedded cluster's password on a real cluster", () => {
     const env = envWith(path.join(folder(), "postgres-password"));
     await expect(checkEmbeddedPostgresPassword(port, dataDir, env)).rejects.toBeInstanceOf(EmbeddedPostgresFixedPasswordError);
     expect(await connects(port, LEGACY_EMBEDDED_POSTGRES_PASSWORD)).toBe(true);
+    // Another instance's cluster on the port is not this one's to stop: a plain error, so a caller can go on elsewhere.
+    const other = checkEmbeddedPostgresPassword(port, path.join(folder(), "another-db"), env);
+    await expect(other).rejects.toThrow(/is not the embedded cluster of/);
+    await expect(other).rejects.not.toBeInstanceOf(EmbeddedPostgresFixedPasswordError);
   }, 120_000);
 
   it("refuses a cluster whose role takes neither password, and leaves it stopped", async () => {

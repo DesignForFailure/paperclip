@@ -28,7 +28,9 @@ import {
   ensurePostgresDatabase,
   formatEmbeddedPostgresError,
   getPostgresDataDirectory,
-  adoptEmbeddedPostgresPassword,
+  EmbeddedPostgresFixedPasswordError,
+  adoptEmbeddedPostgresPasswordPrivately,
+  checkEmbeddedPostgresPassword,
   embeddedPostgresPassword,
   embeddedPostgresUrl,
   inspectMigrations,
@@ -158,6 +160,7 @@ type EmbeddedPostgresCtor = new (opts: {
   port: number;
   persistent: boolean;
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -517,7 +520,7 @@ async function startServerWithDatabaseTeardown(
     const runningPid = getRunningPid();
     if (runningPid) {
       port = embeddedPostgresOwnerPort(readFileSync(postmasterPidFile, "utf8"), dataDir, runningPid);
-      await adoptEmbeddedPostgresPassword(port, dataDir);
+      await checkEmbeddedPostgresPassword(port, dataDir);
       const actualDataDir = await getPostgresDataDirectory(embeddedPostgresUrl(port, "postgres"));
       if (typeof actualDataDir !== "string" || resolve(actualDataDir) !== resolve(dataDir)) {
         throw new Error("Refusing to reuse PostgreSQL: its data directory belongs to another instance.");
@@ -526,7 +529,7 @@ async function startServerWithDatabaseTeardown(
     } else {
       const configuredAdminConnectionString = embeddedPostgresUrl(configuredPort, "postgres");
       try {
-        await adoptEmbeddedPostgresPassword(configuredPort, dataDir);
+        await checkEmbeddedPostgresPassword(configuredPort, dataDir);
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
           typeof actualDataDir !== "string" ||
@@ -538,20 +541,23 @@ async function startServerWithDatabaseTeardown(
         logger.warn(
           `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
         );
-      } catch {
+      } catch (error) {
+        // A running cluster that still has the fixed password is not started again beside it.
+        if (error instanceof EmbeddedPostgresFixedPasswordError) throw error;
         const detectedPort = await detectPort(configuredPort);
         if (detectedPort !== configuredPort) {
           logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
         }
         port = detectedPort;
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        const createEmbeddedPostgres = () => new EmbeddedPostgres({
+        const createEmbeddedPostgres = (postgresFlags: string[] = []) => new EmbeddedPostgres({
           databaseDir: dataDir,
           user: "paperclip",
           password: embeddedPostgresPassword(),
           port,
           persistent: true,
           initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+          postgresFlags,
           onLog: appendEmbeddedPostgresLog,
           onError: appendEmbeddedPostgresLog,
         });
@@ -575,6 +581,10 @@ async function startServerWithDatabaseTeardown(
           logger.warn("Removing stale embedded PostgreSQL lock file");
           rmSync(postmasterPidFile, { force: true });
         }
+        // A cluster made before the configured password file is given its password with no TCP listener first.
+        if ((await adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance: createEmbeddedPostgres })) === "set") {
+          logger.info("Embedded PostgreSQL role given the password in the configured password file (no TCP listener meanwhile)");
+        }
         try {
           await embeddedPostgres.start();
         } catch (err) {
@@ -585,9 +595,7 @@ async function startServerWithDatabaseTeardown(
           });
         }
         embeddedPostgresStartedByThisProcess = true;
-        if ((await adoptEmbeddedPostgresPassword(port, dataDir)) === "set") {
-          logger.info("Embedded PostgreSQL role given the password in the configured password file");
-        }
+        await checkEmbeddedPostgresPassword(port, dataDir);
         embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
           initialInstance: embeddedPostgres,
           createInstance: createEmbeddedPostgres,

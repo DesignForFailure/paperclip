@@ -1,16 +1,20 @@
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import postgres from "postgres";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
-  adoptEmbeddedPostgresPassword,
+  EmbeddedPostgresFixedPasswordError,
+  adoptEmbeddedPostgresPasswordPrivately,
+  checkEmbeddedPostgresPassword,
   embeddedPostgresPassword,
   embeddedPostgresUrl,
 } from "./embedded-postgres-password.js";
-import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
+import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
+import { getEmbeddedPostgresTestSupport } from "./test-embedded-postgres.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 const support = await getEmbeddedPostgresTestSupport();
@@ -75,22 +79,75 @@ describe("embeddedPostgresUrl", () => {
   });
 });
 
-describe("adoptEmbeddedPostgresPassword without a file", () => {
+describe("checkEmbeddedPostgresPassword without a file", () => {
   it("changes nothing and connects to nothing", async () => {
     // Port 1 answers nothing: a connection attempt would throw.
-    await expect(adoptEmbeddedPostgresPassword(1, "/nowhere", {})).resolves.toBe("unchanged");
+    await expect(checkEmbeddedPostgresPassword(1, "/nowhere", {})).resolves.toBe("unchanged");
   });
 });
 
-describePostgres("adoptEmbeddedPostgresPassword on an embedded cluster", () => {
-  async function cluster() {
-    const db = await startEmbeddedPostgresTestDatabase("paperclip-db-password-cluster-");
-    cleanups.push(() => db.cleanup());
-    const port = Number(new URL(db.connectionString).port);
-    const sql = postgres(embeddedPostgresUrl(port, "postgres", LEGACY_EMBEDDED_POSTGRES_PASSWORD), { max: 1 });
-    const [{ data_directory: dataDir }] = await sql<{ data_directory: string }[]>`SHOW data_directory`;
-    await sql.end();
-    return { port, dataDir };
+describe("adoptEmbeddedPostgresPasswordPrivately without anything to do", () => {
+  it("starts nothing without a file, or for a cluster not made yet", async () => {
+    const createInstance = vi.fn();
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir: folder(), port: 1, createInstance, env: {} }))
+      .resolves.toBe("unchanged");
+    const env = envWith(path.join(folder(), "postgres-password"));
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir: folder(), port: 1, createInstance, env }))
+      .resolves.toBe("unchanged");
+    expect(createInstance).not.toHaveBeenCalled();
+  });
+});
+
+async function freePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      server.close(() => (typeof address === "object" && address ? resolve(address.port) : reject(new Error("no port"))));
+    });
+  });
+}
+
+async function tcpRefused(port: number): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    socket.once("connect", () => { socket.destroy(); resolve(false); });
+    socket.once("error", () => resolve(true));
+  });
+}
+
+describePostgres("the embedded cluster's password on a real cluster", () => {
+  type Instance = { initialise(): Promise<void>; start(): Promise<void>; stop(): Promise<void> };
+  type Ctor = new (options: Record<string, unknown>) => Instance;
+
+  /** A cluster made with the fixed password, as every cluster before the file was, and stopped. */
+  async function legacyCluster() {
+    await prepareEmbeddedPostgresNativeRuntime();
+    const EmbeddedPostgres = (await import("embedded-postgres")).default as unknown as Ctor;
+    const dataDir = path.join(folder(), "db");
+    const port = await freePort();
+    const make = (postgresFlags: string[] = []) => new EmbeddedPostgres({
+      databaseDir: dataDir,
+      user: "paperclip",
+      password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
+      port,
+      persistent: true,
+      initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+      postgresFlags,
+      onLog: () => {},
+      onError: () => {},
+    });
+    await make().initialise();
+    return { dataDir, port, make };
+  }
+
+  /** Started on its TCP port until the test ends. */
+  async function started(make: (flags?: string[]) => Instance) {
+    const instance = make();
+    await instance.start();
+    cleanups.push(() => instance.stop());
+    return instance;
   }
 
   async function connects(port: number, password: string): Promise<boolean | string> {
@@ -105,34 +162,60 @@ describePostgres("adoptEmbeddedPostgresPassword on an embedded cluster", () => {
     }
   }
 
-  it("gives a cluster made with the fixed password the file's, once", async () => {
-    const { port, dataDir } = await cluster();
+  it("gives a cluster made with the fixed password the file's while it listens on no TCP port", async () => {
+    const { dataDir, port, make } = await legacyCluster();
     const env = envWith(path.join(folder(), "postgres-password"));
-    await expect(adoptEmbeddedPostgresPassword(port, dataDir, env)).resolves.toBe("set");
+    const flagsSeen: string[][] = [];
+    const tcpWhileAdopting: boolean[] = [];
+    const createInstance = (postgresFlags: string[]) => {
+      flagsSeen.push(postgresFlags);
+      const instance = make(postgresFlags);
+      return {
+        start: async () => {
+          await instance.start();
+          tcpWhileAdopting.push(await tcpRefused(port));
+        },
+        stop: () => instance.stop(),
+      };
+    };
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance, env })).resolves.toBe("set");
+    expect(flagsSeen).toHaveLength(1);
+    expect(flagsSeen[0]?.slice(0, 2)).toEqual(["-c", "listen_addresses="]);
+    expect(tcpWhileAdopting).toEqual([true]);
+    // Its socket folder is gone, and the cluster is stopped.
+    expect(fs.existsSync(flagsSeen[0]![3]!)).toBe(false);
+    expect(await tcpRefused(port)).toBe(true);
+
+    await started(make);
     const password = embeddedPostgresPassword(env);
     expect(await connects(port, password)).toBe(true);
     expect(await connects(port, LEGACY_EMBEDDED_POSTGRES_PASSWORD)).toBe("28P01");
-    await expect(adoptEmbeddedPostgresPassword(port, dataDir, env)).resolves.toBe("unchanged");
+    await expect(checkEmbeddedPostgresPassword(port, dataDir, env)).resolves.toBe("unchanged");
+    // Known to have it now: not started privately again.
+    const again = vi.fn();
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance: again, env })).resolves.toBe("unchanged");
+    expect(again).not.toHaveBeenCalled();
   }, 120_000);
 
-  it("leaves a cluster of another data directory as it is", async () => {
-    const { port } = await cluster();
+  it("never changes the password over TCP: a running cluster with the fixed one is refused as it is", async () => {
+    const { dataDir, port, make } = await legacyCluster();
+    await started(make);
     const env = envWith(path.join(folder(), "postgres-password"));
-    await expect(adoptEmbeddedPostgresPassword(port, "/somewhere/else", env)).rejects.toThrow(/data directory is not/);
+    await expect(checkEmbeddedPostgresPassword(port, dataDir, env)).rejects.toBeInstanceOf(EmbeddedPostgresFixedPasswordError);
     expect(await connects(port, LEGACY_EMBEDDED_POSTGRES_PASSWORD)).toBe(true);
   }, 120_000);
 
-  it("refuses a cluster whose role takes neither password", async () => {
-    const { port, dataDir } = await cluster();
-    const env = envWith(path.join(folder(), "postgres-password"));
+  it("refuses a cluster whose role takes neither password, and leaves it stopped", async () => {
+    const { dataDir, port, make } = await legacyCluster();
+    const running = make();
+    await running.start();
     const sql = postgres(embeddedPostgresUrl(port, "postgres", LEGACY_EMBEDDED_POSTGRES_PASSWORD), { max: 1 });
     await sql.unsafe("ALTER ROLE paperclip WITH PASSWORD 'a-third-one'");
     await sql.end();
-    await expect(adoptEmbeddedPostgresPassword(port, dataDir, env)).rejects.toThrow(/neither the password/);
-    expect(await connects(port, "a-third-one")).toBe(true);
-    // Put back what the test support's cleanup connects with.
-    const back = postgres(embeddedPostgresUrl(port, "postgres", "a-third-one"), { max: 1 });
-    await back.unsafe("ALTER ROLE paperclip WITH PASSWORD 'paperclip'");
-    await back.end();
+    await running.stop();
+    const env = envWith(path.join(folder(), "postgres-password"));
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance: make, env }))
+      .rejects.toThrow(/neither the password/);
+    expect(await tcpRefused(port)).toBe(true);
   }, 120_000);
 });

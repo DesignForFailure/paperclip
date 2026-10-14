@@ -41,8 +41,11 @@ export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecy
 export {
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
-  adoptEmbeddedPostgresPassword,
+  EmbeddedPostgresFixedPasswordError,
+  adoptEmbeddedPostgresPasswordPrivately,
+  checkEmbeddedPostgresPassword,
   embeddedPostgresPassword,
+  type EmbeddedPostgresPrivateInstance,
   embeddedPostgresUrl,
 } from "./embedded-postgres-password.js";
 export { issueRelations } from "./schema/issue_relations.js";

@@ -1,4 +1,4 @@
-import { companies, createDb } from "../packages/db/src/index.js";
+import { companies, createDb, embeddedPostgresUrl } from "../packages/db/src/index.js";
 import { loadConfig } from "../server/src/config.js";
 import { issueReferenceService } from "../server/src/services/issue-references.js";
 
@@ -14,7 +14,7 @@ async function main() {
   const dbUrl =
     process.env.DATABASE_URL?.trim()
     || config.databaseUrl
-    || `postgres://paperclip:paperclip@127.0.0.1:${config.embeddedPostgresPort}/paperclip`;
+    || embeddedPostgresUrl(config.embeddedPostgresPort, "paperclip");
 
   const db = createDb(dbUrl);
   const refs = issueReferenceService(db);

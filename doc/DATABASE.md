@@ -27,6 +27,19 @@ pnpm db:migrate
 
 When `DATABASE_URL` is unset, this command targets the current embedded PostgreSQL instance for your active Paperclip config/instance.
 
+### A password of the instance's own (optional)
+
+By default the embedded cluster's role `paperclip` has the password `paperclip`, so any local process that reaches its loopback port (54329 by default) can open the database. Set `PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE` to an absolute path to give it a password of its own:
+
+- **The file:** the server makes it when it is absent: a random password, mode 0600, in a folder made 0700. A file others can read, or an empty one, is refused.
+- **A new cluster** is initialised with that password.
+- **A cluster made before the file** is given the password once. On its next start the server (or `pnpm db:migrate`) reaches it with the fixed password, checks that its data directory is this instance's, and changes the role's password. From then on `paperclip` no longer opens it.
+- **The same setting is needed** wherever a command opens that database: the CLI's `db:backup`, `routines`, `auth bootstrap-ceo` and `worktree` commands, and the maintenance scripts. Every one reads the variable, or the instance's `.env`.
+- **Worktrees:** `paperclipai worktree init` from an instance that uses a password file gives the worktree a file of its own in the worktree's `secrets/` folder, recorded in its `.env`.
+- **Keep the file:** it holds the only copy of the password. If it's removed, the server makes a new one, the database refuses it, and the server stops with that error until the file is put back.
+
+Unset, nothing changes.
+
 Issue reference mentions follow the normal migration path: the schema migration creates the tracking table, but it does not backfill historical issue titles, descriptions, comments, or documents automatically.
 
 To backfill existing content manually after migrating, run:

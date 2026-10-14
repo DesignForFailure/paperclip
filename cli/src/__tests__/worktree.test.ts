@@ -16,8 +16,10 @@ import {
   companyMemberships,
   createDb,
   closeRegisteredClients,
+  embeddedPostgresUrl,
   ensurePostgresDatabase,
   executionWorkspaces,
+  getPostgresDataDirectory,
   inspectMigrations,
   issueComments,
   issues,
@@ -1508,6 +1510,89 @@ describe("worktree helpers", () => {
       } else {
         process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = originalToolActionSigningSecret;
       }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the worktree a database password file of its own when the source has one", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-db-password-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const originalCwd = process.cwd();
+    const original = process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE;
+    const sourceFile = path.join(tempRoot, "source-secrets", "postgres-password");
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE = sourceFile;
+      process.chdir(repoRoot);
+
+      await worktreeInitCommand({
+        seed: false,
+        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const envContents = fs.readFileSync(path.join(repoRoot, ".paperclip", ".env"), "utf8");
+      const line = envContents.split("\n").find((entry) => entry.startsWith("PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE="));
+      expect(line).toBeDefined();
+      const targetFile = line!.slice(line!.indexOf("=") + 1).replace(/^"|"$/g, "");
+      expect(targetFile).not.toBe(sourceFile);
+      expect(targetFile).toMatch(/[\\/]instances[\\/][^\\/]+[\\/]secrets[\\/]postgres-password$/);
+      expect(targetFile.startsWith(path.join(tempRoot, ".paperclip-worktrees"))).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+      if (original === undefined) delete process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE;
+      else process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE = original;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("names no database password file for a worktree of a source without one", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-no-db-password-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const originalCwd = process.cwd();
+    const original = process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE;
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      delete process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE;
+      process.chdir(repoRoot);
+
+      await worktreeInitCommand({
+        seed: false,
+        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const envContents = fs.readFileSync(path.join(repoRoot, ".paperclip", ".env"), "utf8");
+      expect(envContents).not.toContain("PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE");
+    } finally {
+      process.chdir(originalCwd);
+      if (original !== undefined) process.env.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE = original;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  itEmbeddedPostgres("gives a cluster made before its password file that password when it starts it", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-db-adopt-"));
+    const dataDir = path.join(tempRoot, "db");
+    const passwordEnv = { PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE: path.join(tempRoot, "secrets", "postgres-password") };
+    try {
+      const legacy = await ensureEmbeddedPostgres(dataDir, 55433, { passwordEnv: {} });
+      expect(legacy.password).toBe("paperclip");
+      await legacy.stop();
+
+      const handle = await ensureEmbeddedPostgres(dataDir, 55433, { passwordEnv });
+      try {
+        expect(handle.password).toBe(fs.readFileSync(passwordEnv.PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE, "utf8").trim());
+        await expect(getPostgresDataDirectory(embeddedPostgresUrl(handle.port, "postgres", handle.password)))
+          .resolves.toBe(dataDir);
+        await expect(getPostgresDataDirectory(embeddedPostgresUrl(handle.port, "postgres", "paperclip")))
+          .resolves.toBeNull();
+      } finally {
+        await handle.stop();
+      }
+    } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });

@@ -1,5 +1,5 @@
 #!/usr/bin/env -S node --import tsx
-import { createDb } from "../packages/db/src/index.js";
+import { createDb, embeddedPostgresUrl } from "../packages/db/src/index.js";
 import { loadConfig } from "../server/src/config.js";
 import {
   resolveHotRestartIntentPath,
@@ -82,7 +82,7 @@ async function readPreflightActiveRunIds() {
   const config = loadConfig();
   const dbUrl = process.env.DATABASE_URL?.trim()
     || config.databaseUrl
-    || `postgres://paperclip:paperclip@127.0.0.1:${config.embeddedPostgresPort}/paperclip`;
+    || embeddedPostgresUrl(config.embeddedPostgresPort, "paperclip");
   const db = createDb(dbUrl);
   try {
     const rows = await db.$client<{ id: string }[]>`

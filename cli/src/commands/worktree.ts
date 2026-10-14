@@ -67,6 +67,8 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   embeddedPostgresUrl,
   embeddedPostgresPassword,
+  adoptEmbeddedPostgresPassword,
+  EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, ensureToolActionSigningSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -203,6 +205,8 @@ type EmbeddedPostgresCtor = new (opts: {
 
 type EmbeddedPostgresHandle = {
   port: number;
+  /** The role's password on this cluster: its instance's password file's, or the fixed one (embeddedPasswordEnv). */
+  password: string;
   startedByThisProcess: boolean;
   stop: () => Promise<void>;
 };
@@ -1038,7 +1042,21 @@ async function ensureRepairTargetWorktree(input: {
   };
 }
 
-function resolveSourceConnectionString(config: PaperclipConfig, envEntries: Record<string, string>, portOverride?: number): string {
+/**
+ * The embedded database password setting of the instance whose adjacent .env holds ENV_ENTRIES: its .env's
+ * PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE, else this process's.
+ */
+function embeddedPasswordEnv(envEntries: Record<string, string>): NodeJS.ProcessEnv {
+  const file = nonEmpty(envEntries[EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]);
+  return file ? { [EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]: file } : process.env;
+}
+
+function resolveSourceConnectionString(
+  config: PaperclipConfig,
+  envEntries: Record<string, string>,
+  portOverride?: number,
+  password: string = embeddedPostgresPassword(embeddedPasswordEnv(envEntries)),
+): string {
   if (config.database.mode === "postgres") {
     const connectionString = nonEmpty(envEntries.DATABASE_URL) ?? nonEmpty(config.database.connectionString);
     if (!connectionString) {
@@ -1050,7 +1068,7 @@ function resolveSourceConnectionString(config: PaperclipConfig, envEntries: Reco
   }
 
   const port = portOverride ?? config.database.embeddedPostgresPort;
-  return embeddedPostgresUrl(port, "paperclip");
+  return embeddedPostgresUrl(port, "paperclip", password);
 }
 
 export function copySeededSecretsKey(input: {
@@ -1105,8 +1123,10 @@ export function copySeededSecretsKey(input: {
 export async function ensureEmbeddedPostgres(
   dataDir: string,
   preferredPort: number,
-  options: { allowExisting?: boolean } = {},
+  options: { allowExisting?: boolean; passwordEnv?: NodeJS.ProcessEnv } = {},
 ): Promise<EmbeddedPostgresHandle> {
+  const passwordEnv = options.passwordEnv ?? process.env;
+  const password = embeddedPostgresPassword(passwordEnv);
   const moduleName = "embedded-postgres";
   let EmbeddedPostgres: EmbeddedPostgresCtor;
   try {
@@ -1128,8 +1148,12 @@ export async function ensureEmbeddedPostgres(
         + "Stop the worktree service that owns this database, then retry the seed.",
       );
     }
+    const port = readPidFilePort(postmasterPidFile) ?? preferredPort;
+    // A cluster made before its instance's password file is given that password once (the fork's O-96).
+    await adoptEmbeddedPostgresPassword(port, dataDir, passwordEnv);
     return {
-      port: readPidFilePort(postmasterPidFile) ?? preferredPort,
+      port,
+      password,
       startedByThisProcess: false,
       stop: async () => {},
     };
@@ -1140,7 +1164,7 @@ export async function ensureEmbeddedPostgres(
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password: embeddedPostgresPassword(),
+    password,
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
@@ -1170,8 +1194,16 @@ export async function ensureEmbeddedPostgres(
     });
   }
 
+  try {
+    await adoptEmbeddedPostgresPassword(port, dataDir, passwordEnv);
+  } catch (error) {
+    await instance.stop();
+    throw error;
+  }
+
   return {
     port,
+    password,
     startedByThisProcess: true,
     stop: async () => {
       await instance.stop();
@@ -1474,10 +1506,12 @@ export async function inspectLegacyWorktreeDatabase(
     if (config.database.mode === "embedded-postgres") {
       const dataDir = resolveRuntimeLikePath(config.database.embeddedPostgresDataDir, configPath);
       if (!existsSync(path.join(dataDir, "PG_VERSION"))) return null;
-      embeddedHandle = await ensureEmbeddedPostgres(dataDir, config.database.embeddedPostgresPort);
+      embeddedHandle = await ensureEmbeddedPostgres(dataDir, config.database.embeddedPostgresPort, {
+        passwordEnv: embeddedPasswordEnv(envEntries),
+      });
     }
 
-    const connectionString = resolveSourceConnectionString(config, envEntries, embeddedHandle?.port);
+    const connectionString = resolveSourceConnectionString(config, envEntries, embeddedHandle?.port, embeddedHandle?.password);
     const migrationRevision = resolveWorktreeSeedMigrationRevision(
       await inspectMigrations(connectionString),
       "sourcePrefix",
@@ -1662,14 +1696,16 @@ async function seedWorktreeDatabase(input: {
       sourceHandle = await ensureEmbeddedPostgres(
         input.sourceConfig.database.embeddedPostgresDataDir,
         input.sourceConfig.database.embeddedPostgresPort,
+        { passwordEnv: embeddedPasswordEnv(sourceEnvEntries) },
       );
-      const sourceAdminConnectionString = embeddedPostgresUrl(sourceHandle.port, "postgres");
+      const sourceAdminConnectionString = embeddedPostgresUrl(sourceHandle.port, "postgres", sourceHandle.password);
       await ensurePostgresDatabase(sourceAdminConnectionString, "paperclip");
     }
     const sourceConnectionString = resolveSourceConnectionString(
       input.sourceConfig,
       sourceEnvEntries,
       sourceHandle?.port,
+      sourceHandle?.password,
     );
     input.onPhase?.("source_validation", "started");
     const sourceValidation = await inspectVerifiedSeedDatabase(
@@ -1707,15 +1743,21 @@ async function seedWorktreeDatabase(input: {
     input.onPhase?.("snapshot", "succeeded", `Created ${path.basename(backup.backupFile)}.`);
 
     input.onPhase?.("restore", "started");
+    // The target's own .env decides its password, never this process's (the source's): a target service started
+    // later reads only that file.
+    const targetPasswordFile = nonEmpty(readPaperclipEnvEntries(input.targetPaths.envPath)[EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]);
     targetHandle = await ensureEmbeddedPostgres(
       input.targetConfig.database.embeddedPostgresDataDir,
       input.targetConfig.database.embeddedPostgresPort,
-      { allowExisting: false },
+      {
+        allowExisting: false,
+        passwordEnv: targetPasswordFile ? { [EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]: targetPasswordFile } : {},
+      },
     );
 
-    const adminConnectionString = embeddedPostgresUrl(targetHandle.port, "postgres");
+    const adminConnectionString = embeddedPostgresUrl(targetHandle.port, "postgres", targetHandle.password);
     await resetPostgresDatabase(adminConnectionString, "paperclip");
-    const targetConnectionString = embeddedPostgresUrl(targetHandle.port, "paperclip");
+    const targetConnectionString = embeddedPostgresUrl(targetHandle.port, "paperclip", targetHandle.password);
     await runDatabaseRestore({
       connectionString: targetConnectionString,
       backupFile: backup.backupFile,
@@ -2490,6 +2532,11 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     seedMode,
   });
   const sourceEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(sourceConfigPath));
+  // A source whose embedded database has a password file of its own gives its worktree one of the worktree's own,
+  // in the worktree's secrets folder and named in its .env, which the target's cluster is made with.
+  const sourcePasswordFile =
+    nonEmpty(sourceEnvEntries[EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]) ??
+    nonEmpty(process.env[EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]);
   const existingAgentJwtSecret =
     nonEmpty(sourceEnvEntries.PAPERCLIP_AGENT_JWT_SECRET) ??
     nonEmpty(process.env.PAPERCLIP_AGENT_JWT_SECRET);
@@ -2501,6 +2548,11 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
       ...buildWorktreeEnvEntries(paths, branding),
       ...(existingAgentJwtSecret ? { PAPERCLIP_AGENT_JWT_SECRET: existingAgentJwtSecret } : {}),
       ...(existingToolActionSigningSecret ? { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: existingToolActionSigningSecret } : {}),
+      ...(sourcePasswordFile
+        ? {
+            [EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]: path.resolve(path.dirname(paths.secretsKeyFilePath), "postgres-password"),
+          }
+        : {}),
     },
     paths.envPath,
   );
@@ -3083,9 +3135,10 @@ async function openConfiguredDb(configPath: string): Promise<OpenDbHandle> {
       embeddedHandle = await ensureEmbeddedPostgres(
         config.database.embeddedPostgresDataDir,
         config.database.embeddedPostgresPort,
+        { passwordEnv: embeddedPasswordEnv(envEntries) },
       );
     }
-    const connectionString = resolveSourceConnectionString(config, envEntries, embeddedHandle?.port);
+    const connectionString = resolveSourceConnectionString(config, envEntries, embeddedHandle?.port, embeddedHandle?.password);
     const migrationState = await inspectMigrations(connectionString);
     if (migrationState.status !== "upToDate") {
       const pending =
@@ -4222,12 +4275,13 @@ async function backupWorktreeReseedTarget(input: {
   const targetHandle = await ensureEmbeddedPostgres(
     input.targetConfig.database.embeddedPostgresDataDir,
     input.targetConfig.database.embeddedPostgresPort,
+    { passwordEnv: embeddedPasswordEnv(readPaperclipEnvEntries(input.targetPaths.envPath)) },
   );
   try {
-    const adminConnectionString = embeddedPostgresUrl(targetHandle.port, "postgres");
+    const adminConnectionString = embeddedPostgresUrl(targetHandle.port, "postgres", targetHandle.password);
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const result = await runDatabaseBackup({
-      connectionString: embeddedPostgresUrl(targetHandle.port, "paperclip"),
+      connectionString: embeddedPostgresUrl(targetHandle.port, "paperclip", targetHandle.password),
       backupDir: path.resolve(input.targetPaths.backupDir, "repair"),
       retention: { dailyDays: 30, weeklyWeeks: 12, monthlyMonths: 12 },
       filenamePrefix: `${input.targetPaths.instanceId}-pre-repair`,

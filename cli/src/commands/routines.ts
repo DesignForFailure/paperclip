@@ -13,6 +13,7 @@ import {
   routines,
   embeddedPostgresUrl,
   embeddedPostgresPassword,
+  adoptEmbeddedPostgresPassword,
 } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
 import { loadPaperclipEnvFile } from "../config/env.js";
@@ -124,8 +125,11 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   if (runningPid) {
+    const port = readPidFilePort(postmasterPidFile) ?? preferredPort;
+    // A cluster made before the instance's password file is given that password once (the fork's O-96).
+    await adoptEmbeddedPostgresPassword(port, dataDir);
     return {
-      port: readPidFilePort(postmasterPidFile) ?? preferredPort,
+      port,
       startedByThisProcess: false,
       stop: async () => {},
     };
@@ -166,6 +170,13 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
       fallbackMessage: `Failed to start embedded PostgreSQL on port ${port}`,
       recentLogs: logBuffer.getRecentLogs(),
     });
+  }
+
+  try {
+    await adoptEmbeddedPostgresPassword(port, dataDir);
+  } catch (error) {
+    await instance.stop();
+    throw error;
   }
 
   return {

@@ -102,7 +102,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -10549,6 +10549,8 @@ export function issueService(db: Db) {
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        /** An own-issues key's denied label prefixes: rechecked under the row lock, with the write. */
+        actorDeniedLabelPrefixes?: string[];
         companyGuard?: string;
         /** Set by PATCH when it already rewrote an agent's human_only `done` to `in_review`. */
         humanOnlyCompletionRequested?: boolean;
@@ -10598,6 +10600,7 @@ export function issueService(db: Db) {
         actorRunId,
         actorRunStopId,
         actorUserId,
+        actorDeniedLabelPrefixes,
         companyGuard,
         humanOnlyCompletionRequested,
         ...issueData
@@ -10877,6 +10880,18 @@ export function issueService(db: Db) {
           await assertAgentRunWriteAllowed(tx, receiptExisting.companyId, {
             agentId: actorAgentId, runId: actorRunId, stopId: actorRunStopId,
           });
+        }
+        // An own-issues key's denied labels, read again under this row lock: one attached after the route's check
+        // still keeps the issue from the key (the authorization decision is not atomic with this write).
+        if (actorDeniedLabelPrefixes && actorDeniedLabelPrefixes.length > 0) {
+          const held = await tx
+            .select({ name: labels.name })
+            .from(issueLabels)
+            .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+            .where(eq(issueLabels.issueId, receiptExisting.id))
+            .then((rows: Array<{ name: string }>) => rows.map((row) => row.name)
+              .find((name) => actorDeniedLabelPrefixes.some((prefix) => name.toLowerCase().startsWith(prefix.toLowerCase()))));
+          if (held !== undefined) throw forbidden(`Own-issues key cannot change an issue labelled ${held}`);
         }
         if (actorAgentId && (patch.status === "done" || humanOnlyCompletionRequested === true)) {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);

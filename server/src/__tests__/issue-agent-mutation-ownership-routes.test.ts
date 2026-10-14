@@ -794,6 +794,20 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
+  it("lets an own-issues key make and delete no label", async () => {
+    const app = await createApp(peerActor({
+      keyId: "88888888-8888-4888-8888-888888888888",
+      keyScope: { kind: "own_issues", deniedLabelPrefixes: ["skill:"] },
+    }));
+
+    const made = await request(app).post(`/api/companies/${companyId}/labels`).send({ name: "skill:none", color: "#7b8794" });
+    expect(made.status).toBe(403);
+    expect(made.body.error).toBe("An own-issues key makes and deletes no label");
+    const removed = await request(app).delete("/api/labels/11111111-1111-4111-8111-111111111111");
+    expect(removed.status).toBe(403);
+    expect(removed.body.error).toBe("An own-issues key makes and deletes no label");
+  });
+
   it("uses the company-scope fast path on the issue list route", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
       if (input.action === "company_scope:read") {

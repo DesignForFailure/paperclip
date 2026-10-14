@@ -4138,9 +4138,12 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    // A scoped key sees who it is, never the agent's adapter configuration (an own-issues key: the runtime's own
+    // credentials are there).
     if (
       req.actor.keyScope?.kind === "task_bridge"
       || req.actor.keyScope?.kind === "skill_test"
+      || req.actor.keyScope?.kind === "own_issues"
     ) {
       res.json({
         id: agent.id,

@@ -188,15 +188,28 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().guid(),
 }).strict();
 
+/**
+ * A key for the commands an agent runs on its own, apart from the runtime that holds its standard key: it reads,
+ * comments on and changes only the issues assigned to its own agent, never one carrying a label that begins with one
+ * of `deniedLabelPrefixes` (an issue a gate finishes, through the runtime's own key), and it makes and deletes no
+ * label. Narrowing only: what it may do is still decided as for the agent's standard key.
+ */
+export const ownIssuesAgentKeyScopeSchema = z.object({
+  kind: z.literal("own_issues"),
+  deniedLabelPrefixes: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  ownIssuesAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
+export type OwnIssuesAgentKeyScope = z.infer<typeof ownIssuesAgentKeyScopeSchema>;
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   const parsed = agentApiKeyScopeSchema.safeParse(value);

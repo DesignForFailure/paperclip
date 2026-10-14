@@ -607,6 +607,29 @@ describe.sequential("agent permission routes", () => {
     expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
   }, 20_000);
 
+  it("tells an own-issues key who it is, and nothing of the agent's adapter configuration", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { apiKey: "runtime-key-must-not-leak", env: { TOKEN: "env-value-must-not-leak" } },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: null,
+      source: "agent_key",
+      keyScope: { kind: "own_issues", deniedLabelPrefixes: ["skill:"] },
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/agents/me"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(baseAgent.id);
+    expect(res.body.keyScope).toEqual({ kind: "own_issues", deniedLabelPrefixes: ["skill:"] });
+    expect(res.body.adapterConfig).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain("must-not-leak");
+  }, 20_000);
+
   it("preserves stored env values when a redacted detail response is submitted unchanged", async () => {
     const plaintextValue = "stored-value-must-be-preserved";
     mockAgentService.getById.mockResolvedValue({

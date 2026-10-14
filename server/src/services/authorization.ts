@@ -1249,7 +1249,8 @@ export function authorizationService(db: Db | DbTransaction) {
       return denyOwn("Own-issues key can only access issues assigned to its agent.");
     }
     const prefixes = input.scope.deniedLabelPrefixes ?? [];
-    if (input.action === "issue:mutate" && prefixes.length > 0) {
+    // A comment too: one can carry a state change (`resume` reopens a closed or blocked issue).
+    if ((input.action === "issue:mutate" || input.action === "issue:comment") && prefixes.length > 0) {
       const names = await db
         .select({ name: labels.name })
         .from(issueLabels)
@@ -1258,7 +1259,7 @@ export function authorizationService(db: Db | DbTransaction) {
         .then((rows) => rows.map((row) => row.name));
       const held = names.find((name) => prefixes.some((prefix) => name.toLowerCase().startsWith(prefix.toLowerCase())));
       if (held !== undefined) {
-        return denyOwn(`Own-issues key cannot change an issue labelled ${held}: it is finished through its runtime's own key.`);
+        return denyOwn(`Own-issues key cannot change or comment on an issue labelled ${held}: it is finished through its runtime's own key.`);
       }
     }
     return null;

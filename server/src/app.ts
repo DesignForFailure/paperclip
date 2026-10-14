@@ -24,6 +24,7 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
+import { ownIssuesKeyGuard } from "./middleware/own-issues-key-guard.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -641,6 +642,7 @@ export async function createApp(
   const agentAvatars = agentAvatarRoutes();
   api.use(agentAvatars.router);
   api.use(boardMutationGuard());
+  api.use(ownIssuesKeyGuard());
   api.use(
     "/health",
     healthRoutes(db, {

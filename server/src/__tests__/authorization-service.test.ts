@@ -2773,10 +2773,13 @@ describeEmbeddedPostgres("authorization service", () => {
       await expect(authz.decide({ actor, action, resource: on(peers) }))
         .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
     }
-    // Its own issue that a gate finishes (the prefix matched whatever its case): read and commented on, never changed.
-    await expect(authz.decide({ actor, action: "issue:comment", resource: on(gated) })).resolves.toMatchObject({ allowed: true });
-    await expect(authz.decide({ actor, action: "issue:mutate", resource: on(gated) }))
-      .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    // Its own issue that a gate finishes (the prefix matched whatever its case): read, never changed, nor commented on
+    // (a comment can carry a state change: `resume` reopens it).
+    await expect(authz.decide({ actor, action: "issue:read", resource: on(gated) })).resolves.toMatchObject({ allowed: true });
+    for (const action of ["issue:comment", "issue:mutate"] as const) {
+      await expect(authz.decide({ actor, action, resource: on(gated) }))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    }
     // Nothing beyond issues: no task made, no agent, project or company read.
     await expect(authz.decide({ actor, action: "tasks:assign", resource: on(own) }))
       .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });

@@ -13617,6 +13617,10 @@ export function issueRoutes(
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         ...(humanOnlyCompletionCoerced ? { humanOnlyCompletionRequested: true } : {}),
+        // An own-issues key's denied labels, rechecked by the service under the row lock it writes with.
+        ...(req.actor.type === "agent" && req.actor.keyScope?.kind === "own_issues"
+          ? { actorDeniedLabelPrefixes: req.actor.keyScope.deniedLabelPrefixes ?? [] }
+          : {}),
       };
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&

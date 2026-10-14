@@ -30,6 +30,8 @@ import {
   toolApplications,
   toolConnections,
   toolOauthStates,
+  labels,
+  issueLabels,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -531,6 +533,29 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         assigneeAgentId: terminatedAgentId,
       },
     });
+  });
+
+  it("refuses, under its row lock, an own-issues key's change to an issue with a denied label", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values([agentRow(companyId, { id: agentId, name: "Commands" })]);
+    const issue = await svc.create(companyId, { title: "A gated issue", description: null, status: "todo", priority: "medium", assigneeAgentId: agentId });
+    const plain = await svc.create(companyId, { title: "A routine issue", description: null, status: "todo", priority: "medium", assigneeAgentId: agentId });
+    // The label arrives after any route's check: only the service's own read, with the write, sees it.
+    const [label] = await db.insert(labels).values({ companyId, name: "skill:code-change", color: "#7b8794" }).returning();
+    await db.insert(issueLabels).values({ issueId: issue.id, labelId: label!.id, companyId });
+    try {
+      await expect(svc.update(issue.id, { status: "blocked", actorDeniedLabelPrefixes: ["SKILL:"] }))
+        .rejects.toMatchObject({ status: 403 });
+      const persisted = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issue.id)).then((rows) => rows[0]);
+      expect(persisted?.status).toBe("todo");
+      // An issue without one is changed as before.
+      await expect(svc.update(plain.id, { status: "blocked", actorDeniedLabelPrefixes: ["skill:"] }))
+        .resolves.toMatchObject({ status: "blocked" });
+    } finally {
+      await db.delete(issueLabels);
+      await db.delete(labels);
+    }
   });
 
   it("rejects invalid ancestor-chain assignees and preserves the existing assignment", async () => {

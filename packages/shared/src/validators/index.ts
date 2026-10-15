@@ -357,6 +357,7 @@ export {
   updateAgentInstructionsPathSchema,
   agentApiKeyScopeSchema,
   normalizeAgentApiKeyScope,
+  readAgentApiKeyScope,
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,

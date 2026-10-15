@@ -12,7 +12,7 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   routines,
   embeddedPostgresUrl,
-  embeddedPostgresPassword,
+  EMBEDDED_POSTGRES_INITDB_PASSWORD,
   adoptEmbeddedPostgresPasswordPrivately,
   checkEmbeddedPostgresPassword,
 } from "@paperclipai/db";
@@ -142,7 +142,8 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
   const createInstance = (postgresFlags: string[] = []) => new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password: embeddedPostgresPassword(),
+    // The fixed password for initdb's temporary file; the configured one is given privately before the first start.
+    password: EMBEDDED_POSTGRES_INITDB_PASSWORD,
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],

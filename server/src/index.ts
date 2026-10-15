@@ -31,7 +31,7 @@ import {
   EmbeddedPostgresFixedPasswordError,
   adoptEmbeddedPostgresPasswordPrivately,
   checkEmbeddedPostgresPassword,
-  embeddedPostgresPassword,
+  EMBEDDED_POSTGRES_INITDB_PASSWORD,
   embeddedPostgresUrl,
   inspectMigrations,
   applyPendingMigrations,
@@ -527,9 +527,10 @@ async function startServerWithDatabaseTeardown(
       }
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = embeddedPostgresUrl(configuredPort, "postgres");
       try {
+        // The check reads the password knowing the data directory, so a missing file is made only where it may be.
         await checkEmbeddedPostgresPassword(configuredPort, dataDir);
+        const configuredAdminConnectionString = embeddedPostgresUrl(configuredPort, "postgres");
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
           typeof actualDataDir !== "string" ||
@@ -553,7 +554,8 @@ async function startServerWithDatabaseTeardown(
         const createEmbeddedPostgres = (postgresFlags: string[] = []) => new EmbeddedPostgres({
           databaseDir: dataDir,
           user: "paperclip",
-          password: embeddedPostgresPassword(),
+          // The fixed password for initdb's temporary file; the configured one is given privately before the first start.
+          password: EMBEDDED_POSTGRES_INITDB_PASSWORD,
           port,
           persistent: true,
           initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],

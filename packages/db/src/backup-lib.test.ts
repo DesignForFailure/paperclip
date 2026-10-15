@@ -51,6 +51,110 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+/**
+ * A stand-in for pg_dump or psql that records its arguments and PGPASSWORD beside OUT, reads its input and exits 0.
+ * Its path is set in ENV_NAME for the test's length.
+ */
+function useCommandStandIn(envName: "PAPERCLIP_PG_DUMP_PATH" | "PAPERCLIP_PSQL_PATH") {
+  const dir = createTempDir("paperclip-db-libpq-standin-");
+  const out = path.join(dir, "seen");
+  const script = path.join(dir, "standin.sh");
+  fs.writeFileSync(
+    script,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > '${out}.args'\nprintf '%s' "\${PGPASSWORD-<unset>}" > '${out}.pgpassword'\ncat > /dev/null\n`,
+    { mode: 0o755 },
+  );
+  const original = process.env[envName];
+  process.env[envName] = script;
+  cleanups.push(() => {
+    if (original === undefined) delete process.env[envName];
+    else process.env[envName] = original;
+  });
+  return {
+    args: () => fs.readFileSync(`${out}.args`, "utf8").split("\n").filter(Boolean),
+    pgpassword: () => fs.readFileSync(`${out}.pgpassword`, "utf8"),
+  };
+}
+
+describe("the database password and the pg_dump/psql command line", () => {
+  it("gives psql the password in PGPASSWORD, not in its arguments, where every local user can read it", async () => {
+    const seen = useCommandStandIn("PAPERCLIP_PSQL_PATH");
+    const backupFile = path.join(createTempDir("paperclip-db-libpq-restore-"), "backup.sql");
+    fs.writeFileSync(backupFile, "SELECT 1;\n");
+
+    await runDatabaseRestore({
+      connectionString: "postgres://paperclip:s3cret%40pw@127.0.0.1:1/paperclip?sslmode=disable",
+      backupFile,
+    });
+
+    expect(seen.args()).toContain("--dbname=postgres://paperclip@127.0.0.1:1/paperclip?sslmode=disable");
+    expect(seen.args().join(" ")).not.toContain("s3cret");
+    expect(seen.pgpassword()).toBe("s3cret@pw");
+  });
+
+  it("takes the password out of every libpq connection form: several hosts, a query parameter, key=value", async () => {
+    const seen = useCommandStandIn("PAPERCLIP_PSQL_PATH");
+    const backupFile = path.join(createTempDir("paperclip-db-libpq-restore-"), "backup.sql");
+    fs.writeFileSync(backupFile, "SELECT 1;\n");
+    const cases: Array<[string, string, string]> = [
+      [
+        "postgresql://paperclip:s3cret%2Fpw@host1:5432,host2:5432/paperclip?target_session_attrs=read-write",
+        "postgresql://paperclip@host1:5432,host2:5432/paperclip?target_session_attrs=read-write",
+        "s3cret/pw",
+      ],
+      [
+        "postgres://paperclip@127.0.0.1:1/paperclip?sslmode=disable&password=s3cret%20pw",
+        "postgres://paperclip@127.0.0.1:1/paperclip?sslmode=disable",
+        "s3cret pw",
+      ],
+      [
+        "host=127.0.0.1 port=1 password = 'it\\'s s3cret' dbname=paperclip",
+        "host=127.0.0.1 port=1 dbname=paperclip",
+        "it's s3cret",
+      ],
+      ["host=127.0.0.1 password=s3cret\\ pw dbname=paperclip", "host=127.0.0.1 dbname=paperclip", "s3cret pw"],
+    ];
+    for (const [connectionString, dbname, password] of cases) {
+      await runDatabaseRestore({ connectionString, backupFile });
+      expect(seen.args(), connectionString).toContain(`--dbname=${dbname}`);
+      expect(seen.args().join(" "), connectionString).not.toContain("s3cret");
+      expect(seen.pgpassword(), connectionString).toBe(password);
+    }
+  });
+
+  it("passes a connection string with no password, or that is not a URL, on as it is", async () => {
+    const seen = useCommandStandIn("PAPERCLIP_PSQL_PATH");
+    const backupFile = path.join(createTempDir("paperclip-db-libpq-restore-"), "backup.sql");
+    fs.writeFileSync(backupFile, "SELECT 1;\n");
+    for (const connectionString of ["postgres://paperclip@127.0.0.1:1/paperclip", "host=127.0.0.1 port=1 dbname=paperclip"]) {
+      await runDatabaseRestore({ connectionString, backupFile });
+      expect(seen.args()).toContain(`--dbname=${connectionString}`);
+    }
+  });
+});
+
+describeEmbeddedPostgres("the database password and pg_dump's command line", () => {
+  it("gives pg_dump the password in PGPASSWORD, not in its arguments", async () => {
+    const connectionString = await createTempDatabase();
+    const password = decodeURIComponent(new URL(connectionString).password);
+    expect(password.length).toBeGreaterThan(0);
+    const seen = useCommandStandIn("PAPERCLIP_PG_DUMP_PATH");
+
+    await runDatabaseBackup({
+      connectionString,
+      backupDir: createTempDir("paperclip-db-libpq-backup-"),
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      filenamePrefix: "paperclip-libpq-test",
+      backupEngine: "pg_dump",
+    });
+
+    const dbname = seen.args().find((arg) => arg.startsWith("--dbname="));
+    expect(dbname).toBeDefined();
+    expect(new URL(dbname!.slice("--dbname=".length)).password).toBe("");
+    expect(seen.pgpassword()).toBe(password);
+  }, 60_000);
+});
+
 describe("createBufferedTextFileWriter", () => {
   it("preserves line boundaries across buffered flushes", async () => {
     const tempDir = createTempDir("paperclip-buffered-writer-");

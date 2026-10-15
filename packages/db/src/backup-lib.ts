@@ -317,16 +317,114 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+/** Percent-decoding as libpq does it; a malformed escape is kept as it is (libpq refuses such a string anyway). */
+function percentDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** A postgres:// or postgresql:// URI without its password, read as libpq reads it: user info, then `password=` in the query. */
+function uriWithoutPassword(uri: string, prefix: string): { dbname: string; password?: string } {
+  let password: string | undefined;
+  let rest = uri.slice(prefix.length);
+  // The user info ends at the first "@" before any "/" (libpq's own scan; several hosts may follow it).
+  const end = rest.search(/[@/]/);
+  if (end >= 0 && rest[end] === "@") {
+    const userInfo = rest.slice(0, end);
+    const colon = userInfo.indexOf(":");
+    if (colon >= 0) {
+      password = percentDecode(userInfo.slice(colon + 1));
+      rest = `${userInfo.slice(0, colon)}${rest.slice(end)}`;
+    }
+  }
+  const query = rest.indexOf("?");
+  if (query >= 0) {
+    const kept = rest.slice(query + 1).split("&").filter((param) => {
+      const equals = param.indexOf("=");
+      if (percentDecode(equals >= 0 ? param.slice(0, equals) : param) !== "password") return true;
+      password = percentDecode(equals >= 0 ? param.slice(equals + 1) : "");
+      return false;
+    });
+    rest = rest.slice(0, query) + (kept.length > 0 ? `?${kept.join("&")}` : "");
+  }
+  return password === undefined ? { dbname: uri } : { dbname: prefix + rest, password };
+}
+
+/**
+ * A keyword/value connection string without its `password` pairs, read as libpq reads it: `key = value`, the value
+ * bare up to white space or in single quotes, a backslash escaping the next character. A string it cannot read is
+ * returned as it is.
+ */
+function keywordValueWithoutPassword(conninfo: string): { dbname: string; password?: string } {
+  const isSpace = (char: string | undefined) => char !== undefined && /\s/.test(char);
+  let password: string | undefined;
+  const kept: string[] = [];
+  let i = 0;
+  while (i < conninfo.length) {
+    while (isSpace(conninfo[i])) i += 1;
+    if (i >= conninfo.length) break;
+    const pairStart = i;
+    while (i < conninfo.length && conninfo[i] !== "=" && !isSpace(conninfo[i])) i += 1;
+    const keyword = conninfo.slice(pairStart, i);
+    while (isSpace(conninfo[i])) i += 1;
+    if (conninfo[i] !== "=" || keyword.length === 0) return { dbname: conninfo };
+    i += 1;
+    while (isSpace(conninfo[i])) i += 1;
+    let value = "";
+    if (conninfo[i] === "'") {
+      i += 1;
+      while (i < conninfo.length && conninfo[i] !== "'") {
+        if (conninfo[i] === "\\" && i + 1 < conninfo.length) i += 1;
+        value += conninfo[i];
+        i += 1;
+      }
+      if (i >= conninfo.length) return { dbname: conninfo };
+      i += 1;
+    } else {
+      while (i < conninfo.length && !isSpace(conninfo[i])) {
+        if (conninfo[i] === "\\" && i + 1 < conninfo.length) i += 1;
+        value += conninfo[i];
+        i += 1;
+      }
+    }
+    if (keyword === "password") password = value;
+    else kept.push(conninfo.slice(pairStart, i));
+  }
+  return password === undefined ? { dbname: conninfo } : { dbname: kept.join(" "), password };
+}
+
+/**
+ * pg_dump's and psql's connection: the connection string without its password, which goes in PGPASSWORD instead. A
+ * command line is readable by every local user (ps, /proc/<pid>/cmdline); a process's environment only by its own
+ * user. Both libpq forms are read: a postgres:// URI (several hosts included) and key=value pairs. A string with no
+ * password is passed on as it is.
+ */
+function libpqConnection(connectionString: string): { dbname: string; env: Record<string, string> } {
+  const prefix = /^postgres(?:ql)?:\/\//.exec(connectionString)?.[0];
+  const stripped = prefix
+    ? uriWithoutPassword(connectionString, prefix)
+    : connectionString.includes("=")
+      ? keywordValueWithoutPassword(connectionString)
+      : { dbname: connectionString };
+  return stripped.password === undefined
+    ? { dbname: connectionString, env: {} }
+    : { dbname: stripped.dbname, env: { PGPASSWORD: stripped.password } };
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const connection = libpqConnection(opts.connectionString);
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connection.dbname}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -337,6 +435,7 @@ async function runPgDumpBackup(opts: {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...connection.env,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -354,10 +453,11 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  const connection = libpqConnection(opts.connectionString);
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connection.dbname}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -366,6 +466,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       stdio: ["pipe", "ignore", "pipe"],
       env: {
         ...process.env,
+        ...connection.env,
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },

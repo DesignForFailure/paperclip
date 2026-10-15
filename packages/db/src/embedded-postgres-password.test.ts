@@ -1,4 +1,4 @@
-import fs, { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -42,7 +42,7 @@ describe("embeddedPostgresPassword", () => {
 
   it("makes the file once, random and readable by its owner alone, in a private folder", () => {
     const file = path.join(folder(), "secrets", "postgres-password");
-    const first = embeddedPostgresPassword(envWith(file));
+    const first = embeddedPostgresPassword(envWith(file), folder());
     expect(first).toMatch(/^[0-9a-f]{48}$/);
     expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(statSync(path.dirname(file)).mode & 0o777).toBe(0o700);
@@ -57,6 +57,24 @@ describe("embeddedPostgresPassword", () => {
     writeFileSync(file, "kept-password\n", { mode: 0o600 });
     expect(embeddedPostgresPassword(envWith(file))).toBe("kept-password");
     expect(readFileSync(file, "utf8")).toBe("kept-password\n");
+  });
+
+  it("makes no new file where its cluster was given a password from one before, and asks for that file back", () => {
+    const dataDir = folder();
+    writeFileSync(path.join(dataDir, "paperclip-role-password.sha256"), "0".repeat(64) + "\n", { mode: 0o600 });
+    const file = path.join(folder(), "secrets", "postgres-password");
+    expect(() => embeddedPostgresPassword(envWith(file), dataDir)).toThrow(/Restore that file/);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("makes no file without the cluster's data folder to look at", () => {
+    const file = path.join(folder(), "secrets", "postgres-password");
+    expect(() => embeddedPostgresPassword(envWith(file))).toThrow(/is missing/);
+    expect(fs.existsSync(file)).toBe(false);
+    // Read where it is there, as before.
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(file, "kept-password\n", { mode: 0o600 });
+    expect(embeddedPostgresPassword(envWith(file))).toBe("kept-password");
   });
 
   it("refuses a file others can read, an empty one, and a relative path", () => {
@@ -207,6 +225,91 @@ describePostgres("the embedded cluster's password on a real cluster", () => {
     const other = checkEmbeddedPostgresPassword(port, path.join(folder(), "another-db"), env);
     await expect(other).rejects.toThrow(/is not the embedded cluster of/);
     await expect(other).rejects.not.toBeInstanceOf(EmbeddedPostgresFixedPasswordError);
+  }, 120_000);
+
+  /** OUTCOME, or "still pending" when it has not settled within MS: a hang fails the test instead of the suite. */
+  async function settlesWithin<T>(outcome: Promise<T>, ms: number): Promise<T | "still pending"> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"still pending">((resolve) => {
+      timer = setTimeout(() => resolve("still pending"), ms);
+    });
+    try {
+      return await Promise.race([outcome, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  it("rejects, never hangs, when the private start fails, and leaves no socket folder", async () => {
+    const { dataDir, port, make } = await legacyCluster();
+    const env = envWith(path.join(folder(), "postgres-password"));
+    const flagsSeen: string[][] = [];
+    // A setting PostgreSQL does not know: the server exits at once, after which stop() would wait for ever.
+    const createInstance = (postgresFlags: string[]) => {
+      flagsSeen.push(postgresFlags);
+      return make([...postgresFlags, "-c", "no_such_setting=1"]);
+    };
+    const outcome = adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance, env })
+      .then(() => "resolved", () => "rejected");
+    expect(await settlesWithin(outcome, 20_000)).toBe("rejected");
+    expect(fs.existsSync(flagsSeen[0]![3]!)).toBe(false);
+    expect(await tcpRefused(port)).toBe(true);
+  }, 60_000);
+
+  it("starts privately when TMPDIR is too long for a Unix socket path in it", async () => {
+    const { dataDir, port, make } = await legacyCluster();
+    const env = envWith(path.join(folder(), "postgres-password"));
+    const longTmp = path.join(folder(), "a-temporary-folder-whose-path-is-too-long-for-a-unix-socket".padEnd(100, "x"));
+    mkdirSync(longTmp, { recursive: true });
+    const flagsSeen: string[][] = [];
+    const socketDirModes: number[] = [];
+    const createInstance = (postgresFlags: string[]) => {
+      flagsSeen.push(postgresFlags);
+      socketDirModes.push(statSync(postgresFlags[3]!).mode & 0o777);
+      return make(postgresFlags);
+    };
+    vi.stubEnv("TMPDIR", longTmp);
+    try {
+      const outcome = adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance, env })
+        .then((result) => result, (error: unknown) => `rejected: ${String(error)}`);
+      expect(await settlesWithin(outcome, 20_000)).toBe("set");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    const socketDir = flagsSeen[0]![3]!;
+    expect(Buffer.byteLength(path.join(socketDir, `.s.PGSQL.${port}`))).toBeLessThanOrEqual(103);
+    expect(socketDirModes).toEqual([0o700]);
+    expect(fs.existsSync(socketDir)).toBe(false);
+    expect(readdirSync(longTmp)).toEqual([]);
+  }, 60_000);
+
+  it("asks for the password file back when it is gone after the cluster was given its password", async () => {
+    const { dataDir, port, make } = await legacyCluster();
+    const file = path.join(folder(), "postgres-password");
+    const env = envWith(file);
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance: make, env })).resolves.toBe("set");
+    rmSync(file);
+
+    const again = vi.fn(make);
+    await expect(adoptEmbeddedPostgresPasswordPrivately({ dataDir, port, createInstance: again, env }))
+      .rejects.toThrow(/Restore that file/);
+    expect(again).not.toHaveBeenCalled();
+    await expect(checkEmbeddedPostgresPassword(port, dataDir, env)).rejects.toThrow(/Restore that file/);
+    expect(fs.existsSync(file)).toBe(false);
+  }, 120_000);
+
+  it("names a private start left running with no TCP listener, instead of a refused connection", async () => {
+    const { dataDir, port, make } = await legacyCluster();
+    const socketDir = folder();
+    // As a start killed during the private adoption leaves it: running, listening on no TCP port.
+    const orphan = make(["-c", "listen_addresses=", "-k", socketDir]);
+    await orphan.start();
+    cleanups.push(() => orphan.stop());
+    const pid = Number(readFileSync(path.join(dataDir, "postmaster.pid"), "utf8").split("\n")[0]);
+    const env = envWith(path.join(folder(), "postgres-password"));
+
+    await expect(checkEmbeddedPostgresPassword(port, dataDir, env))
+      .rejects.toThrow(new RegExp(`no TCP listener[\\s\\S]*pid ${pid}`));
   }, 120_000);
 
   it("refuses a cluster whose role takes neither password, and leaves it stopped", async () => {

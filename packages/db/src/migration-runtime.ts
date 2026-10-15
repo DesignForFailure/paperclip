@@ -8,7 +8,7 @@ import {
   EmbeddedPostgresFixedPasswordError,
   adoptEmbeddedPostgresPasswordPrivately,
   checkEmbeddedPostgresPassword,
-  embeddedPostgresPassword,
+  EMBEDDED_POSTGRES_INITDB_PASSWORD,
   embeddedPostgresUrl,
 } from "./embedded-postgres-password.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
@@ -107,12 +107,13 @@ async function ensureEmbeddedPostgresConnection(
   const pgVersionFile = path.resolve(dataDir, "PG_VERSION");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const runningPort = readPidFilePort(postmasterPidFile);
-  const preferredAdminConnectionString = embeddedPostgresUrl(preferredPort, "postgres");
   const logBuffer = createEmbeddedPostgresLogBuffer();
 
   if (!runningPid && existsSync(pgVersionFile)) {
     try {
+      // The check reads the password knowing the data directory, so a missing file is made only where it may be.
       await checkEmbeddedPostgresPassword(preferredPort, dataDir);
+      const preferredAdminConnectionString = embeddedPostgresUrl(preferredPort, "postgres");
       const actualDataDir = await getPostgresDataDirectory(preferredAdminConnectionString);
       const matchesDataDir =
         typeof actualDataDir === "string" &&
@@ -151,7 +152,8 @@ async function ensureEmbeddedPostgresConnection(
   const createInstance = (postgresFlags: string[] = []) => new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password: embeddedPostgresPassword(),
+    // The fixed password for initdb's temporary file; the configured one is given privately before the first start.
+    password: EMBEDDED_POSTGRES_INITDB_PASSWORD,
     port: selectedPort,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],

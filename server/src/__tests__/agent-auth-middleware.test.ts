@@ -32,7 +32,14 @@ function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
 
 function createDbState(input: {
   agent: { id: string; companyId: string; status?: string };
-  agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
+  agentKey?: {
+    id: string;
+    agentId: string;
+    companyId: string;
+    keyHash: string;
+    responsibleUserId?: string | null;
+    scopeConfig?: unknown;
+  };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null;
     status?: string; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
 }) {
@@ -50,7 +57,7 @@ function createDbState(input: {
         keyHash: input.agentKey.keyHash,
         responsibleUserId: input.agentKey.responsibleUserId ?? null,
         revokedAt: null,
-        scopeConfig: null,
+        scopeConfig: input.agentKey.scopeConfig ?? null,
       }
     : null;
   const runRow = input.run
@@ -512,6 +519,37 @@ describe("agent auth middleware", () => {
       onBehalfOfUserId: "user-key",
       source: "agent_key",
     });
+  });
+
+  it("refuses an agent key whose stored scope it cannot read, never taking it for a standard key", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const ownIssues = { kind: "own_issues", deniedLabelPrefixes: ["skill:"] };
+    const unreadable = [
+      { ...ownIssues, allowedProjectIds: [] },
+      { kind: "own_issues", deniedLabelPrefixes: Array.from({ length: 21 }, (_, i) => `p${i}:`) },
+      { kind: "a_later_kind" },
+      "own_issues",
+    ];
+    for (const [index, scopeConfig] of unreadable.entries()) {
+      const token = `pcp_test_agent_key_unreadable_scope_${index}`;
+      const { db } = createDbState({
+        agent: { id: agentId, companyId },
+        agentKey: { id: randomUUID(), agentId, companyId, keyHash: hashToken(token), responsibleUserId: "user-key", scopeConfig },
+      });
+      const res = await request(createApp(db)).get("/actor").set("Authorization", `Bearer ${token}`);
+      expect(res.status, `${JSON.stringify(scopeConfig)} -> ${JSON.stringify(res.body)}`).toBe(401);
+    }
+
+    // A readable scope is kept as it is stored.
+    const token = "pcp_test_agent_key_own_issues";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: { id: randomUUID(), agentId, companyId, keyHash: hashToken(token), responsibleUserId: "user-key", scopeConfig: ownIssues },
+    });
+    const res = await request(createApp(db)).get("/actor").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(res.body.keyScope).toEqual(ownIssues);
   });
 
   it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {

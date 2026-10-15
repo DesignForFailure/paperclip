@@ -644,6 +644,40 @@ describe("worktree helpers", () => {
     }
   });
 
+  itEmbeddedPostgres("reads an external source database without its stale embedded password setting", async () => {
+    // An instance moved from embedded PostgreSQL to an external one may keep the old setting, its file gone.
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-worktree-external-stale-password-");
+    onTestFinished(() => tempDb.cleanup());
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-external-config-"));
+    try {
+      const configPath = path.join(tempRoot, "config.json");
+      const sourceConfig = buildSourceConfig();
+      const config: PaperclipConfig = {
+        ...sourceConfig,
+        database: {
+          ...sourceConfig.database,
+          mode: "postgres",
+          connectionString: tempDb.connectionString,
+          backup: { ...sourceConfig.database.backup, enabled: false, dir: path.join(tempRoot, "backups") },
+        },
+      };
+      const stalePasswordFile = path.join(tempRoot, "gone", "postgres-password");
+      fs.writeFileSync(configPath, `${JSON.stringify(config)}\n`);
+      fs.writeFileSync(
+        path.join(tempRoot, ".env"),
+        `PAPERCLIP_INSTANCE_ID=external-source\nDATABASE_URL=${JSON.stringify(tempDb.connectionString)}\n`
+          + `PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE=${stalePasswordFile}\n`,
+      );
+
+      await expect(inspectLegacyWorktreeDatabase(configPath)).resolves.toEqual({
+        migrationRevision: expect.stringMatching(/\.sql$/),
+      });
+      expect(fs.existsSync(stalePasswordFile)).toBe(false);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("ensure-seeded seeds once and fast-exits on the verified manifest", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-ensure-seeded-"));
     try {
@@ -1593,6 +1627,56 @@ describe("worktree helpers", () => {
         await handle.stop();
       }
     } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  itEmbeddedPostgres("makes a new cluster without its password ever reaching initdb's temporary file", async () => {
+    // embedded-postgres hands initdb the password in $TMPDIR/pg-password-*, mode 644 under umask 022, and leaves it
+    // there when initdb fails. A new cluster is made with the fixed password and given the file's privately after.
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-db-initdb-"));
+    const initdbTmp = path.join(tempRoot, "tmp");
+    fs.mkdirSync(initdbTmp);
+    const passwordFile = path.join(tempRoot, "secrets", "postgres-password");
+    const passwordEnv = { PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE: passwordFile };
+    const originalTmpdir = process.env.TMPDIR;
+    const seen: string[] = [];
+    const watcher = fs.watch(initdbTmp, (_event, name) => {
+      if (!name || !String(name).startsWith("pg-password-")) return;
+      try {
+        seen.push(fs.readFileSync(path.join(initdbTmp, String(name)), "utf8").trim());
+      } catch {
+        // Already removed.
+      }
+    });
+    try {
+      process.env.TMPDIR = initdbTmp;
+      const dataDir = path.join(tempRoot, "db");
+      const handle = await ensureEmbeddedPostgres(dataDir, 55434, { passwordEnv });
+      try {
+        const password = fs.readFileSync(passwordFile, "utf8").trim();
+        expect(handle.password).toBe(password);
+        expect(seen).not.toContain(password);
+        await expect(getPostgresDataDirectory(embeddedPostgresUrl(handle.port, "postgres", password))).resolves.toBe(dataDir);
+        await expect(getPostgresDataDirectory(embeddedPostgresUrl(handle.port, "postgres", "paperclip"))).resolves.toBeNull();
+      } finally {
+        await handle.stop();
+      }
+
+      // initdb fails on a folder that is not empty and leaves its password file behind: it holds the fixed password.
+      const notEmpty = path.join(tempRoot, "not-empty");
+      fs.mkdirSync(notEmpty);
+      fs.writeFileSync(path.join(notEmpty, "stray"), "x");
+      await expect(ensureEmbeddedPostgres(notEmpty, 55434, { passwordEnv })).rejects.toThrow();
+      const leftovers = fs.readdirSync(initdbTmp).filter((name) => name.startsWith("pg-password-"));
+      expect(leftovers.length).toBeGreaterThan(0);
+      for (const name of leftovers) {
+        expect(fs.readFileSync(path.join(initdbTmp, name), "utf8").trim()).toBe("paperclip");
+      }
+    } finally {
+      watcher.close();
+      if (originalTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = originalTmpdir;
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });

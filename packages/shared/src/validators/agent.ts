@@ -216,6 +216,17 @@ export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   return parsed.success ? parsed.data : { kind: "standard" };
 }
 
+/**
+ * A key's scope as authentication uses it. No scope at all (a key made before scopes, or a standard key) is a standard
+ * key; a scope that is there but cannot be parsed (an unknown kind or field, a value past a limit, as from a newer or an
+ * older build) is null, and the key is refused: an unreadable narrowing never becomes a full key.
+ */
+export function readAgentApiKeyScope(value: unknown): AgentApiKeyScope | null {
+  if (value === null || value === undefined) return { kind: "standard" };
+  const parsed = agentApiKeyScopeSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
 export const createAgentKeySchema = z.object({
   name: z.string().min(1).default("default"),
   scope: agentApiKeyScopeSchema.optional().default({ kind: "standard" }),

@@ -67,6 +67,7 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   embeddedPostgresUrl,
   embeddedPostgresPassword,
+  EMBEDDED_POSTGRES_INITDB_PASSWORD,
   adoptEmbeddedPostgresPasswordPrivately,
   checkEmbeddedPostgresPassword,
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
@@ -1057,7 +1058,7 @@ function resolveSourceConnectionString(
   config: PaperclipConfig,
   envEntries: Record<string, string>,
   portOverride?: number,
-  password: string = embeddedPostgresPassword(embeddedPasswordEnv(envEntries)),
+  password?: string,
 ): string {
   if (config.database.mode === "postgres") {
     const connectionString = nonEmpty(envEntries.DATABASE_URL) ?? nonEmpty(config.database.connectionString);
@@ -1070,7 +1071,8 @@ function resolveSourceConnectionString(
   }
 
   const port = portOverride ?? config.database.embeddedPostgresPort;
-  return embeddedPostgresUrl(port, "paperclip", password);
+  // Read only for an embedded source: an external one may keep a stale embedded password setting.
+  return embeddedPostgresUrl(port, "paperclip", password ?? embeddedPostgresPassword(embeddedPasswordEnv(envEntries)));
 }
 
 export function copySeededSecretsKey(input: {
@@ -1128,7 +1130,7 @@ export async function ensureEmbeddedPostgres(
   options: { allowExisting?: boolean; passwordEnv?: NodeJS.ProcessEnv } = {},
 ): Promise<EmbeddedPostgresHandle> {
   const passwordEnv = options.passwordEnv ?? process.env;
-  const password = embeddedPostgresPassword(passwordEnv);
+  const password = embeddedPostgresPassword(passwordEnv, dataDir);
   const moduleName = "embedded-postgres";
   let EmbeddedPostgres: EmbeddedPostgresCtor;
   try {
@@ -1166,7 +1168,8 @@ export async function ensureEmbeddedPostgres(
   const createInstance = (postgresFlags: string[] = []) => new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password,
+    // The fixed password for initdb's temporary file; the configured one is given privately before the first start.
+    password: EMBEDDED_POSTGRES_INITDB_PASSWORD,
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],

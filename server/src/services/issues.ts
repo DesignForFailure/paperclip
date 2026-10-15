@@ -10917,9 +10917,12 @@ export function issueService(db: Db) {
           patch.status = "in_review";
           patch.completedAt = null;
         } else if (humanOnlyCompletionRequested === true && patch.status === "in_review") {
-          // The route rewrote `done`, but the locked row no longer requires it.
-          patch.status = "done";
-          applyStatusSideEffects("done", patch);
+          // The route rewrote `done` and so skipped its own `done` checks, but the locked row no longer requires a
+          // review: the policy changed meanwhile. Writing `done` here would pass those checks by; the agent retries.
+          throw conflict(
+            "This issue's review policy changed while the update ran. Read the issue again and retry.",
+            { code: "review_policy_changed" },
+          );
         }
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([

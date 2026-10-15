@@ -7556,10 +7556,14 @@ describeEmbeddedPostgres("issueService.update human_only completion coercion", (
     expect(await completionCards(id)).toHaveLength(1);
   });
 
-  it("restores done when the route pre-coerced but the locked row no longer requires review", async () => {
+  it("answers 409 when the route pre-coerced but the locked row no longer requires review, writing nothing", async () => {
+    // The route rewrote `done` to `in_review` and so skipped its `done` checks; the policy changed before the row lock.
     const id = await seedIssue({ reviewPolicy: "anyone" });
-    const updated = await svc.update(id, { status: "in_review", humanOnlyCompletionRequested: true, actorAgentId: agentId });
-    expect(updated?.status).toBe("done");
+    const before = await rowOf(id);
+    await expect(
+      svc.update(id, { status: "in_review", humanOnlyCompletionRequested: true, actorAgentId: agentId }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect((await rowOf(id))?.status).toBe(before?.status);
     expect(await completionCards(id)).toHaveLength(0);
   });
 });

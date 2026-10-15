@@ -92,6 +92,36 @@ describe("the database password and the pg_dump/psql command line", () => {
     expect(seen.pgpassword()).toBe("s3cret@pw");
   });
 
+  it("takes the password out of every libpq connection form: several hosts, a query parameter, key=value", async () => {
+    const seen = useCommandStandIn("PAPERCLIP_PSQL_PATH");
+    const backupFile = path.join(createTempDir("paperclip-db-libpq-restore-"), "backup.sql");
+    fs.writeFileSync(backupFile, "SELECT 1;\n");
+    const cases: Array<[string, string, string]> = [
+      [
+        "postgresql://paperclip:s3cret%2Fpw@host1:5432,host2:5432/paperclip?target_session_attrs=read-write",
+        "postgresql://paperclip@host1:5432,host2:5432/paperclip?target_session_attrs=read-write",
+        "s3cret/pw",
+      ],
+      [
+        "postgres://paperclip@127.0.0.1:1/paperclip?sslmode=disable&password=s3cret%20pw",
+        "postgres://paperclip@127.0.0.1:1/paperclip?sslmode=disable",
+        "s3cret pw",
+      ],
+      [
+        "host=127.0.0.1 port=1 password = 'it\\'s s3cret' dbname=paperclip",
+        "host=127.0.0.1 port=1 dbname=paperclip",
+        "it's s3cret",
+      ],
+      ["host=127.0.0.1 password=s3cret\\ pw dbname=paperclip", "host=127.0.0.1 dbname=paperclip", "s3cret pw"],
+    ];
+    for (const [connectionString, dbname, password] of cases) {
+      await runDatabaseRestore({ connectionString, backupFile });
+      expect(seen.args(), connectionString).toContain(`--dbname=${dbname}`);
+      expect(seen.args().join(" "), connectionString).not.toContain("s3cret");
+      expect(seen.pgpassword(), connectionString).toBe(password);
+    }
+  });
+
   it("passes a connection string with no password, or that is not a URL, on as it is", async () => {
     const seen = useCommandStandIn("PAPERCLIP_PSQL_PATH");
     const backupFile = path.join(createTempDir("paperclip-db-libpq-restore-"), "backup.sql");

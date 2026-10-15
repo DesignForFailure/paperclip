@@ -1597,6 +1597,56 @@ describe("worktree helpers", () => {
     }
   });
 
+  itEmbeddedPostgres("makes a new cluster without its password ever reaching initdb's temporary file", async () => {
+    // embedded-postgres hands initdb the password in $TMPDIR/pg-password-*, mode 644 under umask 022, and leaves it
+    // there when initdb fails. A new cluster is made with the fixed password and given the file's privately after.
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-db-initdb-"));
+    const initdbTmp = path.join(tempRoot, "tmp");
+    fs.mkdirSync(initdbTmp);
+    const passwordFile = path.join(tempRoot, "secrets", "postgres-password");
+    const passwordEnv = { PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE: passwordFile };
+    const originalTmpdir = process.env.TMPDIR;
+    const seen: string[] = [];
+    const watcher = fs.watch(initdbTmp, (_event, name) => {
+      if (!name || !String(name).startsWith("pg-password-")) return;
+      try {
+        seen.push(fs.readFileSync(path.join(initdbTmp, String(name)), "utf8").trim());
+      } catch {
+        // Already removed.
+      }
+    });
+    try {
+      process.env.TMPDIR = initdbTmp;
+      const dataDir = path.join(tempRoot, "db");
+      const handle = await ensureEmbeddedPostgres(dataDir, 55434, { passwordEnv });
+      try {
+        const password = fs.readFileSync(passwordFile, "utf8").trim();
+        expect(handle.password).toBe(password);
+        expect(seen).not.toContain(password);
+        await expect(getPostgresDataDirectory(embeddedPostgresUrl(handle.port, "postgres", password))).resolves.toBe(dataDir);
+        await expect(getPostgresDataDirectory(embeddedPostgresUrl(handle.port, "postgres", "paperclip"))).resolves.toBeNull();
+      } finally {
+        await handle.stop();
+      }
+
+      // initdb fails on a folder that is not empty and leaves its password file behind: it holds the fixed password.
+      const notEmpty = path.join(tempRoot, "not-empty");
+      fs.mkdirSync(notEmpty);
+      fs.writeFileSync(path.join(notEmpty, "stray"), "x");
+      await expect(ensureEmbeddedPostgres(notEmpty, 55434, { passwordEnv })).rejects.toThrow();
+      const leftovers = fs.readdirSync(initdbTmp).filter((name) => name.startsWith("pg-password-"));
+      expect(leftovers.length).toBeGreaterThan(0);
+      for (const name of leftovers) {
+        expect(fs.readFileSync(path.join(initdbTmp, name), "utf8").trim()).toBe("paperclip");
+      }
+    } finally {
+      watcher.close();
+      if (originalTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = originalTmpdir;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("preserves repo-managed worktree checkouts when --force re-runs from the source repo", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-force-preserve-"));
     const repoRoot = path.join(tempRoot, "repo");

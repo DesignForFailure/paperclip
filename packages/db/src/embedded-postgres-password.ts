@@ -28,6 +28,15 @@ import postgres from "postgres";
 export const EMBEDDED_POSTGRES_PASSWORD_FILE_ENV = "PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE";
 export const LEGACY_EMBEDDED_POSTGRES_PASSWORD = "paperclip";
 
+/**
+ * The password a new cluster is made with: always the fixed one. embedded-postgres hands initdb the role's password in
+ * a file it writes to the system temporary folder with the default mode (readable by every local user under umask 022)
+ * and leaves there when initdb fails, so the configured password never goes through it. A new cluster is given the
+ * configured one by `adoptEmbeddedPostgresPasswordPrivately`, with no TCP listener, before it first starts on its port:
+ * every caller runs that between `initialise()` and `start()`.
+ */
+export const EMBEDDED_POSTGRES_INITDB_PASSWORD = LEGACY_EMBEDDED_POSTGRES_PASSWORD;
+
 function passwordFile(env: NodeJS.ProcessEnv): string | null {
   const file = env[EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]?.trim();
   if (!file) return null;

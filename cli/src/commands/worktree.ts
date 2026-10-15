@@ -67,6 +67,7 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   embeddedPostgresUrl,
   embeddedPostgresPassword,
+  EMBEDDED_POSTGRES_INITDB_PASSWORD,
   adoptEmbeddedPostgresPasswordPrivately,
   checkEmbeddedPostgresPassword,
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
@@ -1166,7 +1167,8 @@ export async function ensureEmbeddedPostgres(
   const createInstance = (postgresFlags: string[] = []) => new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
-    password,
+    // The fixed password for initdb's temporary file; the configured one is given privately before the first start.
+    password: EMBEDDED_POSTGRES_INITDB_PASSWORD,
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],

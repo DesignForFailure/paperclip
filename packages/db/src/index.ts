@@ -43,6 +43,7 @@ export {
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
   EmbeddedPostgresFixedPasswordError,
   adoptEmbeddedPostgresPasswordPrivately,
+  EMBEDDED_POSTGRES_INITDB_PASSWORD,
   checkEmbeddedPostgresPassword,
   embeddedPostgresPassword,
   type EmbeddedPostgresPrivateInstance,

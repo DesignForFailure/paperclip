@@ -1058,7 +1058,7 @@ function resolveSourceConnectionString(
   config: PaperclipConfig,
   envEntries: Record<string, string>,
   portOverride?: number,
-  password: string = embeddedPostgresPassword(embeddedPasswordEnv(envEntries)),
+  password?: string,
 ): string {
   if (config.database.mode === "postgres") {
     const connectionString = nonEmpty(envEntries.DATABASE_URL) ?? nonEmpty(config.database.connectionString);
@@ -1071,7 +1071,8 @@ function resolveSourceConnectionString(
   }
 
   const port = portOverride ?? config.database.embeddedPostgresPort;
-  return embeddedPostgresUrl(port, "paperclip", password);
+  // Read only for an embedded source: an external one may keep a stale embedded password setting.
+  return embeddedPostgresUrl(port, "paperclip", password ?? embeddedPostgresPassword(embeddedPasswordEnv(envEntries)));
 }
 
 export function copySeededSecretsKey(input: {

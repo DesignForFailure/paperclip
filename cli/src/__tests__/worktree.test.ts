@@ -644,6 +644,40 @@ describe("worktree helpers", () => {
     }
   });
 
+  itEmbeddedPostgres("reads an external source database without its stale embedded password setting", async () => {
+    // An instance moved from embedded PostgreSQL to an external one may keep the old setting, its file gone.
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-worktree-external-stale-password-");
+    onTestFinished(() => tempDb.cleanup());
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-external-config-"));
+    try {
+      const configPath = path.join(tempRoot, "config.json");
+      const sourceConfig = buildSourceConfig();
+      const config: PaperclipConfig = {
+        ...sourceConfig,
+        database: {
+          ...sourceConfig.database,
+          mode: "postgres",
+          connectionString: tempDb.connectionString,
+          backup: { ...sourceConfig.database.backup, enabled: false, dir: path.join(tempRoot, "backups") },
+        },
+      };
+      const stalePasswordFile = path.join(tempRoot, "gone", "postgres-password");
+      fs.writeFileSync(configPath, `${JSON.stringify(config)}\n`);
+      fs.writeFileSync(
+        path.join(tempRoot, ".env"),
+        `PAPERCLIP_INSTANCE_ID=external-source\nDATABASE_URL=${JSON.stringify(tempDb.connectionString)}\n`
+          + `PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE=${stalePasswordFile}\n`,
+      );
+
+      await expect(inspectLegacyWorktreeDatabase(configPath)).resolves.toEqual({
+        migrationRevision: expect.stringMatching(/\.sql$/),
+      });
+      expect(fs.existsSync(stalePasswordFile)).toBe(false);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("ensure-seeded seeds once and fast-exits on the verified manifest", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-ensure-seeded-"));
     try {

@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { agentApiKeys, boardApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { readAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { boardAuthService } from "../services/board-auth.js";
@@ -45,6 +45,8 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /** The key the socket was opened with, checked again at every ping: a revoked or expired one closes it. */
+  key?: { kind: "agent" | "board"; id: string };
 }
 
 /** Cloud-proxied browser identity resolved from trusted x-paperclip-cloud-* headers. */
@@ -218,6 +220,7 @@ async function authorizeUpgrade(
           companyId,
           actorType: "board",
           actorId: boardKey.userId,
+          key: { kind: "board", id: boardKey.id },
         };
       }
     }
@@ -233,6 +236,13 @@ async function authorizeUpgrade(
   if (!key || key.companyId !== companyId) {
     return null;
   }
+  // The socket sends every event of the company, other agents' run logs among them, and cannot narrow that: an
+  // own-issues key (the fork's, for the commands an agent runs on its own) reaches only its agent's own issues, so it
+  // is refused here, as is a key whose scope this build cannot read.
+  const scope = readAgentApiKeyScope(key.scopeConfig);
+  if (!scope || scope.kind === "own_issues") {
+    return null;
+  }
 
   await db
     .update(agentApiKeys)
@@ -243,6 +253,7 @@ async function authorizeUpgrade(
     companyId,
     actorType: "agent",
     actorId: key.agentId,
+    key: { kind: "agent", id: key.id },
   };
 }
 
@@ -266,6 +277,42 @@ export function setupLiveEventsWebSocketServer(
   const boardAuth = boardAuthService(db);
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
+  const keyByClient = new Map<WsSocket, { kind: "agent" | "board"; id: string }>();
+  let keyRecheck: Promise<void> | null = null;
+
+  /** A key is checked at the upgrade and again here: a socket whose key was revoked, or whose board key expired, closes. */
+  async function closeSocketsOfDeadKeys() {
+    const agentKeyIds = new Set<string>();
+    const boardKeyIds = new Set<string>();
+    for (const key of keyByClient.values()) (key.kind === "agent" ? agentKeyIds : boardKeyIds).add(key.id);
+    if (agentKeyIds.size === 0 && boardKeyIds.size === 0) return;
+    const now = new Date();
+    const [liveAgentKeys, liveBoardKeys] = await Promise.all([
+      agentKeyIds.size === 0
+        ? []
+        : db
+          .select({ id: agentApiKeys.id })
+          .from(agentApiKeys)
+          .where(and(inArray(agentApiKeys.id, [...agentKeyIds]), isNull(agentApiKeys.revokedAt))),
+      boardKeyIds.size === 0
+        ? []
+        : db
+          .select({ id: boardApiKeys.id })
+          .from(boardApiKeys)
+          .where(and(
+            inArray(boardApiKeys.id, [...boardKeyIds]),
+            isNull(boardApiKeys.revokedAt),
+            or(isNull(boardApiKeys.expiresAt), gt(boardApiKeys.expiresAt, now)),
+          )),
+    ]);
+    const live = {
+      agent: new Set(liveAgentKeys.map((row) => row.id)),
+      board: new Set(liveBoardKeys.map((row) => row.id)),
+    };
+    for (const [socket, key] of keyByClient) {
+      if (!live[key.kind].has(key.id)) socket.close(1008, "key revoked or expired");
+    }
+  }
 
   const pingInterval = setInterval(() => {
     for (const socket of wss.clients) {
@@ -275,6 +322,13 @@ export function setupLiveEventsWebSocketServer(
       }
       aliveByClient.set(socket, false);
       socket.ping();
+    }
+    if (!keyRecheck) {
+      keyRecheck = closeSocketsOfDeadKeys()
+        .catch((err) => logger.warn({ err }, "live websocket key recheck failed"))
+        .finally(() => {
+          keyRecheck = null;
+        });
     }
   }, 30000);
 
@@ -292,6 +346,7 @@ export function setupLiveEventsWebSocketServer(
 
     cleanupByClient.set(socket, unsubscribe);
     aliveByClient.set(socket, true);
+    if (context.key) keyByClient.set(socket, context.key);
 
     socket.on("pong", () => {
       aliveByClient.set(socket, true);
@@ -302,6 +357,7 @@ export function setupLiveEventsWebSocketServer(
       if (cleanup) cleanup();
       cleanupByClient.delete(socket);
       aliveByClient.delete(socket);
+      keyByClient.delete(socket);
     });
 
     socket.on("error", (err: Error) => {

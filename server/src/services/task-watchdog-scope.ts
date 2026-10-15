@@ -10,6 +10,7 @@ type AgentRunActor = {
   agentId?: string | null;
   companyId?: string | null;
   runId?: string | null;
+  keyScope?: { kind: string } | null;
 };
 
 type IssueScopeTarget = {
@@ -53,6 +54,8 @@ export async function resolveTaskWatchdogMutationScope(
   actor: AgentRunActor,
 ): Promise<TaskWatchdogMutationScope> {
   if (actor.type !== "agent") return { kind: "none" };
+  // An own-issues key (the fork's) only narrows: a watchdog run of its agent widens it to no other agent's issue.
+  if (actor.keyScope?.kind === "own_issues") return { kind: "none" };
   const agentId = readString(actor.agentId);
   const runId = readString(actor.runId);
   const actorCompanyId = readString(actor.companyId);

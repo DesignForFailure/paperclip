@@ -317,16 +317,36 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+/**
+ * pg_dump's and psql's connection: the URL without its password, which goes in PGPASSWORD instead. A command line is
+ * readable by every local user (ps, /proc/<pid>/cmdline); a process's environment only by its own user. A connection
+ * string that is not a postgres URL, or holds no password, is passed on as it is.
+ */
+function libpqConnection(connectionString: string): { dbname: string; env: Record<string, string> } {
+  try {
+    const url = new URL(connectionString);
+    if ((url.protocol === "postgres:" || url.protocol === "postgresql:") && url.password) {
+      const password = decodeURIComponent(url.password);
+      url.password = "";
+      return { dbname: url.toString(), env: { PGPASSWORD: password } };
+    }
+  } catch {
+    // Not a URL (a key=value string, or several hosts): libpq reads it as it is.
+  }
+  return { dbname: connectionString, env: {} };
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const connection = libpqConnection(opts.connectionString);
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connection.dbname}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -337,6 +357,7 @@ async function runPgDumpBackup(opts: {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...connection.env,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -354,10 +375,11 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  const connection = libpqConnection(opts.connectionString);
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connection.dbname}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -366,6 +388,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       stdio: ["pipe", "ignore", "pipe"],
       env: {
         ...process.env,
+        ...connection.env,
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },

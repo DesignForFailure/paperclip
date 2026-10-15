@@ -22,7 +22,7 @@ import {
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import { isUuidLike, normalizeAgentApiKeyScope, readAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
@@ -439,6 +439,13 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    // A stored scope this build cannot read is refused, never taken for a standard key.
+    const keyScope = readAgentApiKeyScope(key.scopeConfig);
+    if (!keyScope) {
+      next(unauthorized("This agent key's scope cannot be read by this server, so the key is refused; create a new key"));
+      return;
+    }
+
     await db
       .update(agentApiKeys)
       .set({ lastUsedAt: new Date() })
@@ -483,7 +490,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,

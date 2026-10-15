@@ -79,6 +79,18 @@ describe("agent local JWT", () => {
     expect(claims?.key_scope).toEqual({ kind: "skill_test", issueId });
   });
 
+  it("refuses a token whose key_scope it cannot read, never taking it for a standard one", () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const unreadable = [
+      { kind: "own_issues", deniedLabelPrefixes: ["skill:"], allowedProjectIds: [] },
+      { kind: "a_later_kind" },
+    ];
+    for (const scope of unreadable) {
+      const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1", "user-1", scope as never);
+      expect(verifyLocalAgentJwt(token!), JSON.stringify(scope)).toBeNull();
+    }
+  });
+
   it("returns null when secret is missing", () => {
     process.env[secretEnv] = "";
     const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");

@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { normalizeAgentApiKeyScope, type AgentApiKeyScope } from "@paperclipai/shared";
+import { readAgentApiKeyScope, type AgentApiKeyScope } from "@paperclipai/shared";
 import { resolvePaperclipInstanceId } from "./home-paths.js";
 
 interface JwtHeader {
@@ -214,8 +214,10 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
       : null
     : undefined;
   const keyScopeClaim = Object.hasOwn(claims, "key_scope")
-    ? normalizeAgentApiKeyScope(claims.key_scope)
+    ? readAgentApiKeyScope(claims.key_scope)
     : undefined;
+  // A key scope this build cannot read is refused, never taken for a standard key.
+  if (keyScopeClaim === null) return null;
   const iat = typeof claims.iat === "number" ? claims.iat : null;
   const exp = typeof claims.exp === "number" ? claims.exp : null;
   if (!sub || !adapterType || !runId || !iat || !exp) return null;

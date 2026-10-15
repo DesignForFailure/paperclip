@@ -19,9 +19,10 @@ import postgres from "postgres";
  *
  * Upstream every embedded cluster's role `paperclip` has the fixed password `paperclip`, so any local process can
  * reach the database on its loopback port. With PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE set, the password is that
- * file's content instead: made once, random and readable by its owner alone, when the file is absent. A new cluster is
- * made with it; a cluster made before the file is given it once, while it listens on no TCP port and on a Unix socket in
- * a private folder only, so no other process can use the fixed password meanwhile
+ * file's content instead: made once, random and readable by its owner alone, when the file is absent and its cluster
+ * was never given one (else the file must be restored). A cluster, new (made with the fixed password, which is all
+ * initdb's temporary file then holds) or made before the file, is given it once, while it listens on no TCP port and on
+ * a Unix socket in a private folder only, so no other process can use the fixed password meanwhile
  * (`adoptEmbeddedPostgresPasswordPrivately`). Over TCP the password is only checked, never changed
  * (`checkEmbeddedPostgresPassword`). Unset, nothing changes.
  */
@@ -36,6 +37,9 @@ export const LEGACY_EMBEDDED_POSTGRES_PASSWORD = "paperclip";
  * every caller runs that between `initialise()` and `start()`.
  */
 export const EMBEDDED_POSTGRES_INITDB_PASSWORD = LEGACY_EMBEDDED_POSTGRES_PASSWORD;
+
+/** Beside the cluster's files: a digest of the password the cluster is known to have, so it is not started privately again. */
+const PASSWORD_MARKER = "paperclip-role-password.sha256";
 
 function passwordFile(env: NodeJS.ProcessEnv): string | null {
   const file = env[EMBEDDED_POSTGRES_PASSWORD_FILE_ENV]?.trim();
@@ -76,15 +80,32 @@ function createPasswordFile(file: string): string {
   }
 }
 
-/** The password the embedded cluster's role has, or is given: the file's when one is configured, else the fixed one. */
-export function embeddedPostgresPassword(env: NodeJS.ProcessEnv = process.env): string {
+/**
+ * The password the embedded cluster's role has, or is given: the file's when one is configured, else the fixed one.
+ * A missing file is made only for the cluster of DATA_DIR, and only when that cluster was never given a password from a
+ * file (no marker in it): a new random file would not open a cluster that keeps the old password, so that file must be
+ * restored instead. Without DATA_DIR a missing file is an error, never made.
+ */
+export function embeddedPostgresPassword(env: NodeJS.ProcessEnv = process.env, dataDir?: string): string {
   const file = passwordFile(env);
   if (!file) return LEGACY_EMBEDDED_POSTGRES_PASSWORD;
   try {
     return readPasswordFile(file);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return createPasswordFile(file);
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (!dataDir) {
+      throw new Error(
+        `The embedded PostgreSQL password file ${file} is missing. Paperclip makes it when it first starts its embedded `
+          + "database; if that database exists already, restore the file.",
+      );
+    }
+    if (existsSync(path.join(dataDir, PASSWORD_MARKER))) {
+      throw new Error(
+        `The embedded PostgreSQL password file ${file} is missing, but the cluster in ${dataDir} was given the password `
+          + "it held. Restore that file: a new password would not open the cluster.",
+      );
+    }
+    return createPasswordFile(file);
   }
 }
 
@@ -135,9 +156,6 @@ function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-/** Beside the cluster's files: a digest of the password the cluster is known to have, so it is not started privately again. */
-const PASSWORD_MARKER = "paperclip-role-password.sha256";
-
 function digest(password: string): string {
   return createHash("sha256").update(password).digest("hex");
 }
@@ -165,6 +183,41 @@ export class EmbeddedPostgresFixedPasswordError extends Error {
   }
 }
 
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The postmaster.pid lines of DATA_DIR's running server (pid, data directory, start, port, socket folder, listen address, ...), or null. */
+function runningPostmaster(dataDir: string): string[] | null {
+  let lines: string[];
+  try {
+    lines = readFileSync(path.join(dataDir, "postmaster.pid"), "utf8").split("\n");
+  } catch {
+    return null;
+  }
+  const pid = Number(lines[0]);
+  return Number.isSafeInteger(pid) && pid > 0 && isRunning(pid) ? lines : null;
+}
+
+/**
+ * DATA_DIR's server runs and listens on no TCP port: the private start of `adoptEmbeddedPostgresPasswordPrivately`,
+ * left running when the process that started it was killed.
+ */
+export class EmbeddedPostgresNoTcpListenerError extends Error {
+  constructor(dataDir: string, pid: number) {
+    super(
+      `The embedded PostgreSQL of ${dataDir} is running with no TCP listener (pid ${pid}): a Paperclip start was stopped `
+        + `while it gave the cluster its password privately. Stop that server (kill -INT ${pid}) and start Paperclip again.`,
+    );
+    this.name = "EmbeddedPostgresNoTcpListenerError";
+  }
+}
+
 /**
  * The embedded cluster on PORT, whose data directory is DATA_DIR, takes the configured password, checked over TCP and
  * never changed there. `unchanged` when no file is configured or the role has the file's password; throws
@@ -176,14 +229,21 @@ export async function checkEmbeddedPostgresPassword(
   dataDir: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<"unchanged"> {
-  const password = embeddedPostgresPassword(env);
+  const password = embeddedPostgresPassword(env, dataDir);
   if (password === LEGACY_EMBEDDED_POSTGRES_PASSWORD) return "unchanged";
   const current = await probe({ port }, password);
   if (current.result === "ok") {
     if (current.dataDirectory && path.resolve(current.dataDirectory) === path.resolve(dataDir)) markHas(dataDir, password);
     return "unchanged";
   }
-  if (current.result === "unreachable") throw current.error;
+  if (current.result === "unreachable") {
+    // Line 6 of postmaster.pid is the first listen address, empty for a server with no TCP listener.
+    const running = runningPostmaster(dataDir);
+    if (running && running.length > 5 && running[5]!.trim() === "") {
+      throw new EmbeddedPostgresNoTcpListenerError(dataDir, Number(running[0]));
+    }
+    throw current.error;
+  }
   const legacy = await probe({ port }, LEGACY_EMBEDDED_POSTGRES_PASSWORD);
   if (legacy.result === "ok") {
     // Only this instance's cluster is the one to stop and start again; another PostgreSQL on the port is not it, and a
@@ -201,6 +261,51 @@ export async function checkEmbeddedPostgresPassword(
 /** An embedded cluster's instance as `embedded-postgres` makes it. */
 export type EmbeddedPostgresPrivateInstance = { start(): Promise<void>; stop(): Promise<void> };
 
+const SOCKET_DIR_PREFIX = "paperclip-pg-";
+/** A Unix socket path's longest: sun_path holds 108 bytes on Linux and 104 elsewhere, its closing NUL among them. */
+const SOCKET_PATH_MAX = process.platform === "linux" ? 107 : 103;
+
+/**
+ * A new folder readable by its owner alone (mkdtemp's mode) for the private start's socket, in the temporary folder
+ * when the socket's path fits there and in /tmp when TMPDIR is too long for it.
+ */
+function privateSocketDir(port: number): string {
+  const socketName = `.s.PGSQL.${port}`;
+  const bases = process.platform === "win32" ? [os.tmpdir()] : [os.tmpdir(), "/tmp"];
+  for (const base of bases) {
+    // mkdtemp adds six characters to the prefix.
+    if (Buffer.byteLength(path.join(base, `${SOCKET_DIR_PREFIX}XXXXXX`, socketName)) <= SOCKET_PATH_MAX) {
+      return mkdtempSync(path.join(base, SOCKET_DIR_PREFIX));
+    }
+  }
+  throw new Error(
+    `No temporary folder gives the embedded PostgreSQL's private socket a path of ${SOCKET_PATH_MAX} bytes or fewer `
+      + `(TMPDIR is ${os.tmpdir()}). Set TMPDIR to a shorter folder and start Paperclip again.`,
+  );
+}
+
+/**
+ * Stops the private start of DATA_DIR's server. `embedded-postgres`'s stop() waits for an exit event: for a server that
+ * has exited already it would wait for ever, so it is called only for a running server, and the wait also ends when
+ * the server's pid is gone.
+ */
+async function stopPrivateStart(instance: EmbeddedPostgresPrivateInstance, dataDir: string): Promise<void> {
+  const running = runningPostmaster(dataDir);
+  if (!running) return;
+  const pid = Number(running[0]);
+  let poll: NodeJS.Timeout | undefined;
+  const exited = new Promise<void>((resolve) => {
+    poll = setInterval(() => {
+      if (!isRunning(pid)) resolve();
+    }, 100);
+  });
+  try {
+    await Promise.race([instance.stop(), exited]);
+  } finally {
+    clearInterval(poll);
+  }
+}
+
 /**
  * Before the existing cluster of DATA_DIR is started on its TCP port: when a password file is configured and the
  * cluster is not known to have its password, start it with no TCP listener and its socket in a new private folder
@@ -215,17 +320,19 @@ export async function adoptEmbeddedPostgresPasswordPrivately(input: {
   env?: NodeJS.ProcessEnv;
 }): Promise<"unchanged" | "set"> {
   const env = input.env ?? process.env;
-  const password = embeddedPostgresPassword(env);
+  const password = embeddedPostgresPassword(env, input.dataDir);
   if (password === LEGACY_EMBEDDED_POSTGRES_PASSWORD) return "unchanged";
   if (!existsSync(path.join(input.dataDir, "PG_VERSION"))) return "unchanged";
   if (knownToHave(input.dataDir, password)) return "unchanged";
 
-  // mkdtemp makes the folder readable by its owner alone; the socket in it is reachable by no one else.
-  const socketDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-pg-"));
+  // The socket's folder is readable by its owner alone: the socket in it is reachable by no one else.
+  const socketDir = privateSocketDir(input.port);
   const target = { port: input.port, socketDir };
   const instance = input.createInstance(["-c", "listen_addresses=", "-k", socketDir]);
+  let started = false;
   try {
     await instance.start();
+    started = true;
     let result: "unchanged" | "set" = "unchanged";
     const current = await probe(target, password);
     if (current.result !== "ok") {
@@ -247,7 +354,8 @@ export async function adoptEmbeddedPostgresPasswordPrivately(input: {
     markHas(input.dataDir, password);
     return result;
   } finally {
-    await instance.stop();
+    // A start that failed has exited already (start() rejects when the server closes): nothing to stop.
+    if (started) await stopPrivateStart(instance, input.dataDir);
     rmSync(socketDir, { recursive: true, force: true });
   }
 }

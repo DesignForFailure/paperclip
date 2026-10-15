@@ -42,6 +42,7 @@ export {
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
   EmbeddedPostgresFixedPasswordError,
+  EmbeddedPostgresNoTcpListenerError,
   adoptEmbeddedPostgresPasswordPrivately,
   EMBEDDED_POSTGRES_INITDB_PASSWORD,
   checkEmbeddedPostgresPassword,

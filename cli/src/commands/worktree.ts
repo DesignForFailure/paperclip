@@ -1129,7 +1129,7 @@ export async function ensureEmbeddedPostgres(
   options: { allowExisting?: boolean; passwordEnv?: NodeJS.ProcessEnv } = {},
 ): Promise<EmbeddedPostgresHandle> {
   const passwordEnv = options.passwordEnv ?? process.env;
-  const password = embeddedPostgresPassword(passwordEnv);
+  const password = embeddedPostgresPassword(passwordEnv, dataDir);
   const moduleName = "embedded-postgres";
   let EmbeddedPostgres: EmbeddedPostgresCtor;
   try {

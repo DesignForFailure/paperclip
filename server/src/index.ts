@@ -527,9 +527,10 @@ async function startServerWithDatabaseTeardown(
       }
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = embeddedPostgresUrl(configuredPort, "postgres");
       try {
+        // The check reads the password knowing the data directory, so a missing file is made only where it may be.
         await checkEmbeddedPostgresPassword(configuredPort, dataDir);
+        const configuredAdminConnectionString = embeddedPostgresUrl(configuredPort, "postgres");
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
           typeof actualDataDir !== "string" ||

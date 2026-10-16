@@ -1079,6 +1079,15 @@ for a duplicate request id, and return `409` with the current projection for a
 stale revision or an unconfirmed unfinished-goal replacement. These controls do
 not create issue comments.
 
+`PATCH /issues/:issueId` is conditional when the body carries
+`expectedUpdatedAt`, the `updatedAt` the client read: the update applies only
+while the issue still has it, compared at millisecond precision under the row
+lock the update writes with, and otherwise returns `409` (`issue_changed`) with
+the current issue and writes nothing. The route checks first as well, before
+any side effect of the request. Every issue-service update moves `updatedAt` at
+least one millisecond past the row's, so each version it writes has a stamp of
+its own. Without the field the update is unconditional.
+
 ### 10.4.1 Atomic Checkout Contract
 
 `POST /issues/:issueId/checkout` request:

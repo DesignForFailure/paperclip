@@ -124,6 +124,35 @@ The server sets `Preference-Applied: return=minimal` and returns exactly:
 
 **The PATCH response is the authoritative post-write state. A confirming GET after a 2xx PATCH is unnecessary.**
 
+### Conditional Update
+
+A client that computed its change from what it read, such as a whole `labelIds` set, sends the `updatedAt` it read as `expectedUpdatedAt`:
+
+```
+PATCH /api/issues/{issueId}
+{
+  "labelIds": ["{labelId}", "{otherLabelId}"],
+  "expectedUpdatedAt": "2026-07-30T12:01:00.000Z"
+}
+```
+
+The update applies only while the issue still has that `updatedAt`. It is compared at millisecond precision, as the API gives it, under the row lock the update writes with. When another write landed first, the response is `409` and nothing is written:
+
+```json
+{
+  "error": "This issue changed after the version this update expected (expectedUpdatedAt). Read it again and retry.",
+  "code": "issue_changed",
+  "details": {
+    "code": "issue_changed",
+    "expectedUpdatedAt": "2026-07-30T12:01:00.000Z",
+    "updatedAt": "2026-07-30T12:01:04.250Z",
+    "issue": { "id": "issue-99", "updatedAt": "2026-07-30T12:01:04.250Z", "labelIds": ["{labelId}"] }
+  }
+}
+```
+
+`details.issue` is the issue's current row with its labels. Apply your own change to it and send it again with its `updatedAt`. Each `PATCH` moves `updatedAt` at least one millisecond past the row's previous value, so no two of them share one. Without `expectedUpdatedAt` the update is unconditional.
+
 ## Checkout (Claim Task)
 
 ```

@@ -12001,11 +12001,20 @@ export function issueService(db: Db) {
     },
 
     deleteLabel: async (id: string) =>
-      db
-        .delete(labels)
-        .where(eq(labels.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null),
+      db.transaction(async (tx) => {
+        // The cascade takes the label off every issue that carries it. Their versions move on first, under their row
+        // locks, past each row's millisecond (as nextIssueUpdatedAt does): a conditional update made on the old label
+        // set is then refused, 409 issue_changed, not written over the change (issue-conditional-update.ts).
+        await tx.execute(sql`
+          update ${issues}
+          set updated_at = greatest(${new Date().toISOString()}::timestamptz, date_trunc('milliseconds', ${issues.updatedAt}) + interval '1 millisecond')
+          where ${issues.id} in (select ${issueLabels.issueId} from ${issueLabels} where ${issueLabels.labelId} = ${id})`);
+        return tx
+          .delete(labels)
+          .where(eq(labels.id, id))
+          .returning()
+          .then((rows: Array<typeof labels.$inferSelect>) => rows[0] ?? null);
+      }),
 
     listComments: async (
       issueId: string,

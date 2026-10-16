@@ -18,6 +18,28 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
  * written; the version is compared at the millisecond precision the API gives, and every update is a version of its own.
  */
 
+/** Runs once, the next time the route looks up a heartbeat run: another write landing in the middle of a PATCH. */
+const hooks = vi.hoisted(() => ({ beforeGetRun: null as null | (() => Promise<void>) }));
+
+vi.mock("../services/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/index.js")>();
+  return {
+    ...actual,
+    heartbeatService: (...args: Parameters<typeof actual.heartbeatService>) => {
+      const heartbeat = actual.heartbeatService(...args);
+      return {
+        ...heartbeat,
+        getRun: async (runId: string) => {
+          const hook = hooks.beforeGetRun;
+          hooks.beforeGetRun = null;
+          if (hook) await hook();
+          return heartbeat.getRun(runId);
+        },
+      };
+    },
+  };
+});
+
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
   return {
@@ -59,6 +81,7 @@ describePostgres("conditional issue PATCH", () => {
   }, 60_000);
 
   afterEach(async () => {
+    hooks.beforeGetRun = null;
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
   });
@@ -201,6 +224,46 @@ describePostgres("conditional issue PATCH", () => {
     const current = await rowOf(issueId);
     const updated = await svc.update(issueId, { labelIds: [pinned, working], expectedUpdatedAt: current.updatedAt });
     expect(updated?.labelIds.sort()).toEqual([pinned, working].sort());
+  });
+
+  it("moves the version of every issue a deleted label is taken off, so an update made on the old label set is refused", async () => {
+    const { companyId, issueId, pinned, working, app } = await seed();
+    const otherId = randomUUID();
+    await db.insert(issues).values({ id: otherId, companyId, title: "Other card", status: "todo", priority: "medium" });
+    await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [pinned, working] });
+    const read = await request(app).get(`/api/issues/${issueId}`);
+    const untouched = (await rowOf(otherId)).updatedAt.getTime();
+    const removed = await request(app).delete(`/api/labels/${working}`);
+    expect(removed.status, JSON.stringify(removed.body)).toBe(200);
+    expect(Date.parse((await request(app).get(`/api/issues/${issueId}`)).body.updatedAt)).toBeGreaterThan(Date.parse(read.body.updatedAt));
+    expect((await rowOf(otherId)).updatedAt.getTime()).toBe(untouched);
+    // The writer read [pinned, working] and drops pinned: refused as a change it did not see, not a 422 or a write.
+    const stale = await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [working], expectedUpdatedAt: read.body.updatedAt });
+    expect(stale.status, JSON.stringify(stale.body)).toBe(409);
+    expect(stale.body.details.issue.labelIds).toEqual([pinned]);
+    expect(await labelIdsOf(issueId)).toEqual([pinned]);
+  });
+
+  it("checks again right before its first side effect: a write that lands after the route's first check cancels no run", async () => {
+    const { companyId, issueId, app } = await seed();
+    const agentId = randomUUID();
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "running", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(issues).set({ assigneeAgentId: agentId, status: "in_progress", executionRunId: runId }).where(eq(issues.id, issueId));
+    const read = await request(app).get(`/api/issues/${issueId}`);
+    // The route's first check passes; then, while it looks up the run to interrupt, another write lands.
+    hooks.beforeGetRun = async () => {
+      await issueService(db).update(issueId, { title: "Renamed meanwhile" });
+    };
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "Stop that", interrupt: true, expectedUpdatedAt: read.body.updatedAt });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.issue.title).toBe("Renamed meanwhile");
+    const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, runId));
   });
 
   it("refuses a stale update before its side effects: a board interrupt cancels no run", async () => {

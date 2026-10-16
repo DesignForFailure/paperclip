@@ -151,7 +151,7 @@ The update applies only while the issue still has that `updatedAt`. It is compar
 }
 ```
 
-`details.issue` is the issue's current row with its labels. Apply your own change to it and send it again with its `updatedAt`. Each `PATCH` moves `updatedAt` at least one millisecond past the row's previous value, so no two of them share one, and deleting a label moves the `updatedAt` of every issue it is taken off. Without `expectedUpdatedAt` the update is unconditional.
+`details.issue` is the issue's current row with its labels. Apply your own change to it and send it again with its `updatedAt`. Every update that sets an issue's `updatedAt`, whoever makes it, moves it at least one millisecond past the row's previous value (a database trigger), so no two versions share one; deleting a label moves the `updatedAt` of every issue it is taken off. Without `expectedUpdatedAt` the update is unconditional.
 
 Some updates first stop the issue's active run or goal, cancel a scheduled retry or reopen a workspace. A conditional one checks the version again right before the first of these, so a request whose issue changed by then has no side effect. A write that lands while those side effects run still makes the update answer `409` after them: the issue itself is not written.
 

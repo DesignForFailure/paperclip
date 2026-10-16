@@ -9,7 +9,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
-import { nextIssueUpdatedAt, sameIssueVersion } from "../services/issue-conditional-update.js";
+import { sameIssueVersion } from "../services/issue-conditional-update.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 /**
@@ -58,13 +58,6 @@ describe("issue versions", () => {
     expect(sameIssueVersion(stored, new Date("2026-10-16T12:00:00.123Z"))).toBe(true);
     expect(sameIssueVersion(stored, new Date("2026-10-16T12:00:00.124Z"))).toBe(false);
     expect(sameIssueVersion(stored, new Date("2026-10-16T12:00:00.122Z"))).toBe(false);
-  });
-
-  it("move on by at least a millisecond with every update, even when the clock does not", () => {
-    const previous = new Date("2026-10-16T12:00:00.123Z");
-    expect(nextIssueUpdatedAt(new Date("2026-10-16T12:00:05.000Z"), previous).toISOString()).toBe("2026-10-16T12:00:05.000Z");
-    expect(nextIssueUpdatedAt(new Date(previous), previous).toISOString()).toBe("2026-10-16T12:00:00.124Z");
-    expect(nextIssueUpdatedAt(new Date("2026-10-16T11:59:00.000Z"), previous).toISOString()).toBe("2026-10-16T12:00:00.124Z");
   });
 });
 
@@ -156,8 +149,8 @@ describePostgres("conditional issue PATCH", () => {
   });
 
   it("matches a row Postgres stamped in microseconds by the milliseconds the API gave, and no other", async () => {
-    const { issueId, pinned, app } = await seed();
-    await db.execute(sql`UPDATE issues SET updated_at = '2026-10-16 12:00:00.123789+00' WHERE id = ${issueId}`);
+    // Stamped at insert, as the column default now() does: an update could not move updated_at back (0286's trigger).
+    const { issueId, pinned, app } = await seed({ updatedAt: sql`'2026-10-16 12:00:00.123789+00'::timestamptz` as unknown as Date });
     const read = await request(app).get(`/api/issues/${issueId}`);
     expect(read.body.updatedAt).toBe("2026-10-16T12:00:00.123Z");
     for (const off of ["2026-10-16T12:00:00.122Z", "2026-10-16T12:00:00.124Z", "2026-10-16T12:00:00.000Z"]) {
@@ -181,6 +174,31 @@ describePostgres("conditional issue PATCH", () => {
     const stale = await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [working], expectedUpdatedAt: read.body.updatedAt });
     expect(stale.status, JSON.stringify(stale.body)).toBe(409);
     expect(await labelIdsOf(issueId)).toEqual([pinned]);
+  });
+
+  it("moves a direct write of the row (not through the issue service) made in the version's own millisecond past it", async () => {
+    // Run dispatch clears a run's execution lock with `updatedAt: input.now` (modules/run-dispatch/adapters/postgres.ts:703-711);
+    // here its `now` falls in the millisecond of the version a client read.
+    const { issueId, pinned, working, app } = await seed();
+    await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [pinned] });
+    const read = await request(app).get(`/api/issues/${issueId}`);
+    const version = Date.parse(read.body.updatedAt);
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: new Date(version) })
+      .where(eq(issues.id, issueId));
+    expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 1);
+    // So is a raw write that names a time behind the row's (a clock stepped back), and one that names no new time at all.
+    await db.execute(sql`UPDATE issues SET updated_at = updated_at - interval '1 hour' WHERE id = ${issueId}`);
+    expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 2);
+    await db.execute(sql`UPDATE issues SET updated_at = updated_at WHERE id = ${issueId}`);
+    expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 3);
+    const stale = await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [working], expectedUpdatedAt: read.body.updatedAt });
+    expect(stale.status, JSON.stringify(stale.body)).toBe(409);
+    expect(await labelIdsOf(issueId)).toEqual([pinned]);
+    // A write that does not set updated_at leaves it as it is.
+    await db.update(issues).set({ priority: "high" }).where(eq(issues.id, issueId));
+    expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 3);
   });
 
   it("applies one of two conditional updates of the same version, and answers the other 409", async () => {

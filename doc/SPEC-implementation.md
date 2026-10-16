@@ -1086,10 +1086,11 @@ lock the update writes with, and otherwise returns `409` (`issue_changed`) with
 the current issue and writes nothing. The route checks first as well, and once
 more right before its first side effect (a run or goal stopped, a scheduled
 retry cancelled, a workspace reopened); a write that lands while those run still
-makes the update answer `409` after them. Every issue-service update moves
-`updatedAt` at least one millisecond past the row's, so each version it writes
-has a stamp of its own, and deleting a label moves the `updatedAt` of every
-issue it is taken off. Without the field the update is unconditional.
+makes the update answer `409` after them. A trigger on `issues` moves every
+update that sets `updated_at`, whoever makes it, at least one millisecond past
+the row's own, so each version has a stamp of its own; deleting a label moves
+the `updated_at` of every issue it is taken off. Without the field the update is
+unconditional.
 
 ### 10.4.1 Atomic Checkout Contract
 

@@ -202,7 +202,7 @@ import {
   agentRemovalOfHumanOnlyIssue,
   humanOnlyRemovalRefused,
 } from "./issue-review-policy.js";
-import { issueChangedConflict, nextIssueUpdatedAt, sameIssueVersion } from "./issue-conditional-update.js";
+import { issueChangedConflict, sameIssueVersion } from "./issue-conditional-update.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
@@ -10887,10 +10887,6 @@ export function issueService(db: Db) {
           const [current] = await withIssueLabels(tx, [receiptExisting]);
           throw issueChangedConflict(current, expectedUpdatedAt);
         }
-        // Past the locked row's millisecond, so that every update is a version of its own (issue-conditional-update.ts).
-        const writtenAt = nextIssueUpdatedAt(patch.updatedAt as Date, receiptExisting.updatedAt);
-        if (patch.blockedTransitionAt === patch.updatedAt) patch.blockedTransitionAt = writtenAt;
-        patch.updatedAt = writtenAt;
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -12003,12 +11999,12 @@ export function issueService(db: Db) {
     deleteLabel: async (id: string) =>
       db.transaction(async (tx) => {
         // The cascade takes the label off every issue that carries it. Their versions move on first, under their row
-        // locks, past each row's millisecond (as nextIssueUpdatedAt does): a conditional update made on the old label
-        // set is then refused, 409 issue_changed, not written over the change (issue-conditional-update.ts).
-        await tx.execute(sql`
-          update ${issues}
-          set updated_at = greatest(${new Date().toISOString()}::timestamptz, date_trunc('milliseconds', ${issues.updatedAt}) + interval '1 millisecond')
-          where ${issues.id} in (select ${issueLabels.issueId} from ${issueLabels} where ${issueLabels.labelId} = ${id})`);
+        // locks (the updated_at trigger keeps each past its row's millisecond): a conditional update made on the old
+        // label set is then refused, 409 issue_changed, not written over the change (issue-conditional-update.ts).
+        await tx
+          .update(issues)
+          .set({ updatedAt: new Date() })
+          .where(inArray(issues.id, tx.select({ id: issueLabels.issueId }).from(issueLabels).where(eq(issueLabels.labelId, id))));
         return tx
           .delete(labels)
           .where(eq(labels.id, id))

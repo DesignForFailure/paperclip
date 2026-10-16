@@ -294,9 +294,12 @@ is unique, so retries return the original accepted action. Provider source
 ordering fences duplicate and stale updates, and a cleared projection retains
 its revision/cursor tombstone so an older provider event cannot resurrect it.
 
-Issue `status_version` advances only when `status` changes. The JavaScript backup
-path includes user-defined functions and triggers so a restored database keeps
-that invariant. Removing or disabling a future native rollout flag must not
+Issue `status_version` advances only when `status` changes. An update that sets
+an issue's `updated_at` moves it at least one millisecond past the row's own
+(`paperclip_issue_updated_at_version`, migration 0286), so a conditional
+`PATCH /issues/:id` (`expectedUpdatedAt`, compared at milliseconds) tells every
+two versions apart. The JavaScript backup path includes user-defined functions
+and triggers so a restored database keeps both invariants. Removing or disabling a future native rollout flag must not
 delete these records; persisted experimental runs remain available for recovery
 and inspection.
 

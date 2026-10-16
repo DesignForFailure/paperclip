@@ -17,21 +17,16 @@ import { conflict } from "../errors.js";
  *
  * Milliseconds tell two versions apart only if no update gives the row the
  * millisecond it already has, which two updates within one millisecond, or a
- * clock stepped back, otherwise do: a client that read the first would pass
- * against the second. `nextIssueUpdatedAt` moves every update past the locked
- * row's millisecond.
+ * clock behind the row's, otherwise do: a client that read the first would pass
+ * against the second. A trigger moves every update that sets `updated_at` at
+ * least one millisecond past the row's own, whoever writes it
+ * (packages/db/src/migrations/0286_issue_updated_at_version.sql).
  */
 export const ISSUE_CHANGED_CODE = "issue_changed";
 
 /** Whether the row's `updatedAt` is the version the client read, at millisecond precision. */
 export function sameIssueVersion(updatedAt: Date, expected: Date): boolean {
   return Math.trunc(updatedAt.getTime()) === Math.trunc(expected.getTime());
-}
-
-/** The `updatedAt` an update writes: `now`, or one millisecond past the row's when `now` is not later than it. */
-export function nextIssueUpdatedAt(now: Date, previous: Date): Date {
-  const floor = Math.trunc(previous.getTime()) + 1;
-  return now.getTime() >= floor ? now : new Date(floor);
 }
 
 /** The 409 for a conditional update of an issue that changed: the current issue rides in `details.issue`. */

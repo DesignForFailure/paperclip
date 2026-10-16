@@ -324,6 +324,7 @@ import {
   agentRemovalOfHumanOnlyIssue,
   humanOnlyRemovalRefused,
 } from "../services/issue-review-policy.js";
+import { issueChangedConflict, sameIssueVersion } from "../services/issue-conditional-update.js";
 import {
   evaluateIssueThreadInteractionResolverAudience,
   issueThreadInteractionAttentionAgentAllowed,
@@ -12856,6 +12857,14 @@ export function issueRoutes(
         { allowVisibleIssueWrite: true },
       );
       if (!issueMutationAccess) return;
+      // A conditional update (expectedUpdatedAt) of an issue that changed since the client read it is refused here,
+      // before any side effect of this PATCH (a run interrupted or stopped, a goal stopped, a workspace reopened). The
+      // issue service checks again under the row lock it writes with, which is the check that holds.
+      const expectedUpdatedAt =
+        typeof req.body.expectedUpdatedAt === "string" ? new Date(req.body.expectedUpdatedAt) : undefined;
+      if (expectedUpdatedAt && !sameIssueVersion(existing.updatedAt, expectedUpdatedAt)) {
+        throw issueChangedConflict(existing, expectedUpdatedAt);
+      }
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
       const issueMutationAuthorizationReason =
         req.actor.type === "agent"
@@ -12891,6 +12900,7 @@ export function issueRoutes(
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
+        expectedUpdatedAt: _expectedUpdatedAt,
         ...updateFields
       } = req.body;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
@@ -12905,6 +12915,7 @@ export function issueRoutes(
                 "assigneeAgentId",
                 "assigneeUserId",
                 "deferWakeForGoal",
+                "expectedUpdatedAt",
               ].includes(key),
           ))
       ) {
@@ -13617,6 +13628,7 @@ export function issueRoutes(
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         ...(humanOnlyCompletionCoerced ? { humanOnlyCompletionRequested: true } : {}),
+        ...(expectedUpdatedAt ? { expectedUpdatedAt } : {}),
         // An own-issues key's denied labels, rechecked by the service under the row lock it writes with.
         ...(req.actor.type === "agent" && req.actor.keyScope?.kind === "own_issues"
           ? { actorDeniedLabelPrefixes: req.actor.keyScope.deniedLabelPrefixes ?? [] }

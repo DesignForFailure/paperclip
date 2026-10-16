@@ -202,6 +202,7 @@ import {
   agentRemovalOfHumanOnlyIssue,
   humanOnlyRemovalRefused,
 } from "./issue-review-policy.js";
+import { issueChangedConflict, nextIssueUpdatedAt, sameIssueVersion } from "./issue-conditional-update.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
@@ -10554,6 +10555,11 @@ export function issueService(db: Db) {
         companyGuard?: string;
         /** Set by PATCH when it already rewrote an agent's human_only `done` to `in_review`. */
         humanOnlyCompletionRequested?: boolean;
+        /**
+         * A conditional update (PATCH `expectedUpdatedAt`): applied only while the locked row still has this
+         * `updatedAt`, at millisecond precision; otherwise 409 `issue_changed` and nothing is written.
+         */
+        expectedUpdatedAt?: Date;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10603,6 +10609,7 @@ export function issueService(db: Db) {
         actorDeniedLabelPrefixes,
         companyGuard,
         humanOnlyCompletionRequested,
+        expectedUpdatedAt,
         ...issueData
       } = data;
       if (
@@ -10874,6 +10881,16 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // A conditional update, checked under the row lock it writes with: no other write can land between the
+        // check and this one. The route checked before its side effects too; this is the check that holds.
+        if (expectedUpdatedAt !== undefined && !sameIssueVersion(receiptExisting.updatedAt, expectedUpdatedAt)) {
+          const [current] = await withIssueLabels(tx, [receiptExisting]);
+          throw issueChangedConflict(current, expectedUpdatedAt);
+        }
+        // Past the locked row's millisecond, so that every update is a version of its own (issue-conditional-update.ts).
+        const writtenAt = nextIssueUpdatedAt(patch.updatedAt as Date, receiptExisting.updatedAt);
+        if (patch.blockedTransitionAt === patch.updatedAt) patch.blockedTransitionAt = writtenAt;
+        patch.updatedAt = writtenAt;
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

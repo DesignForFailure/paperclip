@@ -324,6 +324,7 @@ import {
   agentRemovalOfHumanOnlyIssue,
   humanOnlyRemovalRefused,
 } from "../services/issue-review-policy.js";
+import { issueChangedConflict, sameIssueVersion } from "../services/issue-conditional-update.js";
 import {
   evaluateIssueThreadInteractionResolverAudience,
   issueThreadInteractionAttentionAgentAllowed,
@@ -12856,6 +12857,28 @@ export function issueRoutes(
         { allowVisibleIssueWrite: true },
       );
       if (!issueMutationAccess) return;
+      // A conditional update (expectedUpdatedAt) of an issue that changed since the client read it is refused here,
+      // and once more right before this PATCH's first side effect that the update cannot undo (admitVersion). The issue
+      // service checks again under the row lock it writes with, which is the check that holds.
+      const expectedUpdatedAt =
+        typeof req.body.expectedUpdatedAt === "string" ? new Date(req.body.expectedUpdatedAt) : undefined;
+      if (expectedUpdatedAt && !sameIssueVersion(existing.updatedAt, expectedUpdatedAt)) {
+        throw issueChangedConflict(existing, expectedUpdatedAt);
+      }
+      // Run right before the first side effect (a run interrupted or stopped, a goal stopped, a scheduled retry
+      // cancelled, a workspace reopened): the checks and reads above leave time for another write to land, and a
+      // stale request must not start one. Once only: the side effects themselves move updatedAt (releasing a run's
+      // execution lock touches the issue), and a later check would refuse this request for its own work. A write that
+      // lands while they run still makes the locked check refuse the update after them.
+      let versionAdmitted = expectedUpdatedAt === undefined;
+      const admitVersion = async () => {
+        if (versionAdmitted || !expectedUpdatedAt) return;
+        versionAdmitted = true;
+        const current = await svc.getById(existing.id);
+        if (current && !sameIssueVersion(current.updatedAt, expectedUpdatedAt)) {
+          throw issueChangedConflict(current, expectedUpdatedAt);
+        }
+      };
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
       const issueMutationAuthorizationReason =
         req.actor.type === "agent"
@@ -12891,6 +12914,7 @@ export function issueRoutes(
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
+        expectedUpdatedAt: _expectedUpdatedAt,
         ...updateFields
       } = req.body;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
@@ -12905,6 +12929,7 @@ export function issueRoutes(
                 "assigneeAgentId",
                 "assigneeUserId",
                 "deferWakeForGoal",
+                "expectedUpdatedAt",
               ].includes(key),
           ))
       ) {
@@ -13151,6 +13176,7 @@ export function issueRoutes(
 
         const runToInterrupt = await resolveActiveIssueRun(existing);
         if (runToInterrupt) {
+          await admitVersion();
           const cancelled = await heartbeat.cancelRun(
             runToInterrupt.id,
             "Interrupted by board comment",
@@ -13205,6 +13231,7 @@ export function issueRoutes(
         shouldResumeInProgressScheduledRetry &&
         updateFields.status === "todo"
       ) {
+        await admitVersion();
         cancelledScheduledRetryRunId =
           await cancelScheduledRetrySupersededByComment({
             scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
@@ -13508,6 +13535,7 @@ export function issueRoutes(
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
       if (assigneeWillChange && existing.assigneeAgentId) {
+        await admitVersion();
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13547,6 +13575,7 @@ export function issueRoutes(
         terminalizingIssue &&
         existing.assigneeAgentId
       ) {
+        await admitVersion();
         const goalStopAction = await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13617,6 +13646,7 @@ export function issueRoutes(
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         ...(humanOnlyCompletionCoerced ? { humanOnlyCompletionRequested: true } : {}),
+        ...(expectedUpdatedAt ? { expectedUpdatedAt } : {}),
         // An own-issues key's denied labels, rechecked by the service under the row lock it writes with.
         ...(req.actor.type === "agent" && req.actor.keyScope?.kind === "own_issues"
           ? { actorDeniedLabelPrefixes: req.actor.keyScope.deniedLabelPrefixes ?? [] }
@@ -13734,6 +13764,7 @@ export function issueRoutes(
       let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
       let reopenedGeneration: number | null = null;
       if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
+        await admitVersion();
         const reopenOutcome =
           await reopenClosedIssueExecutionWorkspaceOrRespond(
             req,

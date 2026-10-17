@@ -202,6 +202,7 @@ import {
   agentRemovalOfHumanOnlyIssue,
   humanOnlyRemovalRefused,
 } from "./issue-review-policy.js";
+import { issueChangedConflict, sameIssueVersion } from "./issue-conditional-update.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
@@ -10554,6 +10555,11 @@ export function issueService(db: Db) {
         companyGuard?: string;
         /** Set by PATCH when it already rewrote an agent's human_only `done` to `in_review`. */
         humanOnlyCompletionRequested?: boolean;
+        /**
+         * A conditional update (PATCH `expectedUpdatedAt`): applied only while the locked row still has this
+         * `updatedAt`, at millisecond precision; otherwise 409 `issue_changed` and nothing is written.
+         */
+        expectedUpdatedAt?: Date;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10603,6 +10609,7 @@ export function issueService(db: Db) {
         actorDeniedLabelPrefixes,
         companyGuard,
         humanOnlyCompletionRequested,
+        expectedUpdatedAt,
         ...issueData
       } = data;
       if (
@@ -10874,6 +10881,12 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // A conditional update, checked under the row lock it writes with: no other write can land between the
+        // check and this one. The route checked before its side effects too; this is the check that holds.
+        if (expectedUpdatedAt !== undefined && !sameIssueVersion(receiptExisting.updatedAt, expectedUpdatedAt)) {
+          const [current] = await withIssueLabels(tx, [receiptExisting]);
+          throw issueChangedConflict(current, expectedUpdatedAt);
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11984,11 +11997,22 @@ export function issueService(db: Db) {
     },
 
     deleteLabel: async (id: string) =>
-      db
-        .delete(labels)
-        .where(eq(labels.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null),
+      db.transaction(async (tx) => {
+        // The cascade takes the label off every issue that carries it. Their versions move on first, under their row
+        // locks, past each row's millisecond: a conditional update made on the old label set is then refused, 409
+        // issue_changed, not written over the change (issue-conditional-update.ts). The new value never equals the
+        // row's own: the row changes in no other column, and the updated_at trigger leaves a write that changes
+        // nothing alone (migration 0286).
+        await tx.execute(sql`
+          update ${issues}
+          set updated_at = greatest(${new Date().toISOString()}::timestamptz, date_trunc('milliseconds', ${issues.updatedAt}) + interval '1 millisecond')
+          where ${issues.id} in (select ${issueLabels.issueId} from ${issueLabels} where ${issueLabels.labelId} = ${id})`);
+        return tx
+          .delete(labels)
+          .where(eq(labels.id, id))
+          .returning()
+          .then((rows: Array<typeof labels.$inferSelect>) => rows[0] ?? null);
+      }),
 
     listComments: async (
       issueId: string,

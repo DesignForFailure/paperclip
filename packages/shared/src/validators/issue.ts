@@ -868,6 +868,12 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
+    /**
+     * Conditional update: the `updatedAt` the client read. The update applies only while the issue still has it
+     * (compared at millisecond precision, as the API gives it); otherwise 409 `issue_changed` with the current issue,
+     * and nothing is written. Omitted, the update is unconditional.
+     */
+    expectedUpdatedAt: z.string().datetime().optional(),
   });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

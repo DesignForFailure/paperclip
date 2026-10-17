@@ -295,10 +295,14 @@ ordering fences duplicate and stale updates, and a cleared projection retains
 its revision/cursor tombstone so an older provider event cannot resurrect it.
 
 Issue `status_version` advances only when `status` changes. An update that sets
-an issue's `updated_at` moves it at least one millisecond past the row's own
-(`paperclip_issue_updated_at_version`, migration 0286), so a conditional
-`PATCH /issues/:id` (`expectedUpdatedAt`, compared at milliseconds) tells every
-two versions apart. The JavaScript backup path includes user-defined functions
+an issue's `updated_at` and changes the row moves it at least one millisecond
+past the row's own (`paperclip_issue_updated_at_version`, migration 0286), so a
+conditional `PATCH /issues/:id` (`expectedUpdatedAt`, compared at milliseconds)
+tells every two versions apart. An update that changes nothing in the row is no
+new version and is left alone (an import's never-backwards recency bump). A
+migration's own writes are exempt: the runner sets
+`paperclip.applying_migrations` for each migration's transaction, so a repair
+can still set an issue's `updated_at` back. The JavaScript backup path includes user-defined functions
 and triggers so a restored database keeps both invariants. Removing or disabling a future native rollout flag must not
 delete these records; persisted experimental runs remain available for recovery
 and inspection.

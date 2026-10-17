@@ -18,8 +18,8 @@ import { conflict } from "../errors.js";
  * Milliseconds tell two versions apart only if no update gives the row the
  * millisecond it already has, which two updates within one millisecond, or a
  * clock behind the row's, otherwise do: a client that read the first would pass
- * against the second. A trigger moves every update that sets `updated_at` at
- * least one millisecond past the row's own, whoever writes it
+ * against the second. A trigger moves every update that sets `updated_at` and
+ * changes the row at least one millisecond past the row's own, whoever writes it
  * (packages/db/src/migrations/0286_issue_updated_at_version.sql).
  */
 export const ISSUE_CHANGED_CODE = "issue_changed";

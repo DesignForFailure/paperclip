@@ -177,21 +177,26 @@ describePostgres("conditional issue PATCH", () => {
   });
 
   it("moves a direct write of the row (not through the issue service) made in the version's own millisecond past it", async () => {
-    // Run dispatch clears a run's execution lock with `updatedAt: input.now` (modules/run-dispatch/adapters/postgres.ts:703-711);
-    // here its `now` falls in the millisecond of the version a client read.
+    // The wake queue takes an issue's execution lock with `updatedAt: input.now` (modules/wake-queue/adapters/postgres.ts:483-490),
+    // and run dispatch clears it the same way (run-dispatch/adapters/postgres.ts:703-711); here that `now` is the
+    // millisecond of the version a client read.
     const { issueId, pinned, working, app } = await seed();
     await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [pinned] });
     const read = await request(app).get(`/api/issues/${issueId}`);
     const version = Date.parse(read.body.updatedAt);
     await db
       .update(issues)
-      .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: new Date(version) })
+      .set({ executionAgentNameKey: "worker", executionLockedAt: new Date(version), updatedAt: new Date(version) })
       .where(eq(issues.id, issueId));
     expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 1);
-    // So is a raw write that names a time behind the row's (a clock stepped back), and one that names no new time at all.
+    // So is a raw write that names a time behind the row's (a clock stepped back).
     await db.execute(sql`UPDATE issues SET updated_at = updated_at - interval '1 hour' WHERE id = ${issueId}`);
     expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 2);
-    await db.execute(sql`UPDATE issues SET updated_at = updated_at WHERE id = ${issueId}`);
+    // A write that changes nothing in the row is no new version (an import's "never backwards" recency bump).
+    await db.execute(sql`UPDATE issues SET updated_at = greatest(updated_at, '2026-01-01T00:00:00Z'::timestamptz) WHERE id = ${issueId}`);
+    expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 2);
+    // A write in the row's exact millisecond that changes another column is one.
+    await db.update(issues).set({ priority: "low", updatedAt: new Date(version + 2) }).where(eq(issues.id, issueId));
     expect((await rowOf(issueId)).updatedAt.getTime()).toBe(version + 3);
     const stale = await request(app).patch(`/api/issues/${issueId}`).send({ labelIds: [working], expectedUpdatedAt: read.body.updatedAt });
     expect(stale.status, JSON.stringify(stale.body)).toBe(409);

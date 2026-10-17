@@ -9,6 +9,8 @@ import { withTransientWriteRetry } from "./transient-write-retry.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
+/** Set (transaction-local) while a migration applies; the issues updated_at trigger reads it (migration 0286). */
+const APPLYING_MIGRATIONS_SETTING = "paperclip.applying_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
 function createUtilitySql(url: string) {
@@ -476,6 +478,10 @@ async function applyPendingMigrationsManually(
       if (existingEntry) continue;
 
       await runInTransaction(sql, async () => {
+        // A migration means the updated_at it writes: a repair may set an issue's back, or to the value it has. The
+        // issues trigger that keeps every runtime write a new version (0286_issue_updated_at_version.sql) leaves the
+        // writes of this transaction alone. Migrations run before the server serves, so no client version races them.
+        await sql.unsafe(`SET LOCAL ${APPLYING_MIGRATIONS_SETTING} = 'on'`);
         for (const statement of splitMigrationStatements(migrationContent)) {
           await sql.unsafe(statement);
         }

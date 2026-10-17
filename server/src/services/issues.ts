@@ -2098,6 +2098,18 @@ function truncateInlineSummary(
     : normalized;
 }
 
+/**
+ * Fork (Continuum): the label names that settle an open child for its parent's `issue_children_completed` wake, as
+ * `done` and `cancelled` do. `PAPERCLIP_SETTLED_CHILD_LABELS`, comma-separated, each name trimmed, empty ones dropped;
+ * unset or empty, none, as upstream. Read on each call, as the decision service reads its settings.
+ */
+function settledChildLabelNames(): string[] {
+  return (process.env.PAPERCLIP_SETTLED_CHILD_LABELS ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
 function truncateByCodePoint(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return Array.from(value).slice(0, maxChars).join("");
@@ -9144,12 +9156,29 @@ export function issueService(db: Db) {
         )
         .orderBy(asc(issues.issueNumber), asc(issues.createdAt));
       if (children.length === 0) return null;
-      if (
-        !children.every(
-          (child) => child.status === "done" || child.status === "cancelled",
-        )
-      ) {
-        return null;
+      const openChildIds = children
+        .filter((child) => child.status !== "done" && child.status !== "cancelled")
+        .map((child) => child.id);
+      if (openChildIds.length > 0) {
+        // Fork (Continuum): an open child that carries a label named in PAPERCLIP_SETTLED_CHILD_LABELS is settled too.
+        const settledLabelNames = settledChildLabelNames();
+        if (settledLabelNames.length === 0) return null;
+        const settledChildIds = new Set(
+          await db
+            .selectDistinct({ issueId: issueLabels.issueId })
+            .from(issueLabels)
+            .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+            .where(
+              and(
+                eq(issueLabels.companyId, parent.companyId),
+                eq(labels.companyId, parent.companyId),
+                inArray(issueLabels.issueId, openChildIds),
+                inArray(labels.name, settledLabelNames),
+              ),
+            )
+            .then((rows) => rows.map((row) => row.issueId)),
+        );
+        if (!openChildIds.every((id) => settledChildIds.has(id))) return null;
       }
 
       const childIdsForSummaries = children

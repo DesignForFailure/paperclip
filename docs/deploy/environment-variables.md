@@ -15,6 +15,7 @@ All environment variables that Paperclip uses for server configuration.
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
 | `PAPERCLIP_EMBEDDED_POSTGRES_PASSWORD_FILE` | (unset) | Absolute path of the embedded database's password file, made at the cluster's first start when absent; unset, the fixed `paperclip` password ([Database](database.md)) |
+| `PAPERCLIP_EMBEDDED_POSTGRES_FLAGS` | (unset) | Whitespace-separated `key=value` server settings for the embedded cluster (e.g. `shared_buffers=64MB max_connections=20`), given as `-c key=value` at each start by the server and `pnpm db:migrate`; refused unless every pair is `key=value`, and for the settings Paperclip decides (port, listen and socket addresses, its files). Unset, PostgreSQL's defaults ([Database](database.md)) |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |

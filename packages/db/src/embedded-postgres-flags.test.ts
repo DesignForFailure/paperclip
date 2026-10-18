@@ -96,7 +96,8 @@ describePostgres("PAPERCLIP_EMBEDDED_POSTGRES_FLAGS on a real cluster", () => {
     }));
     vi.stubEnv("PAPERCLIP_CONFIG", configPath);
     vi.stubEnv("DATABASE_URL", "");
-    if (flags !== undefined) vi.stubEnv(EMBEDDED_POSTGRES_FLAGS_ENV, flags);
+    // Stubbed either way, so a value in the environment the suite runs in is not read.
+    vi.stubEnv(EMBEDDED_POSTGRES_FLAGS_ENV, flags ?? "");
     const connection = await resolveMigrationConnection();
     cleanups.push(() => connection.stop());
     const sql = postgres(embeddedPostgresUrl(port, "postgres"), { max: 1, onnotice: () => {} });

@@ -86,7 +86,7 @@ async function freePort(): Promise<number> {
 
 describePostgres("PAPERCLIP_EMBEDDED_POSTGRES_FLAGS on a real cluster", () => {
   /** `db:migrate`'s cluster (migration-runtime), started for a config of its own with the flags given, and its settings. */
-  async function settingsOfMigrationCluster(flags: string | undefined) {
+  async function settingsOfMigrationCluster(flags: string | undefined, envFile?: string) {
     const dir = mkdtempSync(path.join(os.tmpdir(), "paperclip-db-flags-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const port = await freePort();
@@ -96,8 +96,10 @@ describePostgres("PAPERCLIP_EMBEDDED_POSTGRES_FLAGS on a real cluster", () => {
     }));
     vi.stubEnv("PAPERCLIP_CONFIG", configPath);
     vi.stubEnv("DATABASE_URL", "");
-    // Stubbed either way, so a value in the environment the suite runs in is not read.
-    vi.stubEnv(EMBEDDED_POSTGRES_FLAGS_ENV, flags ?? "");
+    // Stubbed either way, so a value in the environment the suite runs in is not read; with an instance .env, `undefined`
+    // takes the variable out of the environment.
+    if (envFile !== undefined) writeFileSync(path.join(dir, ".env"), envFile);
+    vi.stubEnv(EMBEDDED_POSTGRES_FLAGS_ENV, envFile !== undefined ? flags : flags ?? "");
     const connection = await resolveMigrationConnection();
     cleanups.push(() => connection.stop());
     const sql = postgres(embeddedPostgresUrl(port, "postgres"), { max: 1, onnotice: () => {} });
@@ -126,6 +128,15 @@ describePostgres("PAPERCLIP_EMBEDDED_POSTGRES_FLAGS on a real cluster", () => {
       work_mem: "4MB",
       max_parallel_workers: "8",
     });
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS * 2);
+
+  it("reads the instance's .env when the environment does not set it, as the server's start does", async () => {
+    const file = `# instance env\nDATABASE_URL=\n${EMBEDDED_POSTGRES_FLAGS_ENV}="shared_buffers=64MB max_connections=20"\n`;
+    expect(await settingsOfMigrationCluster(undefined, file)).toMatchObject({ shared_buffers: "64MB", max_connections: "20" });
+    while (cleanups.length) await cleanups.pop()?.();
+    vi.unstubAllEnvs();
+    // The environment's value wins, even an empty one (dotenv's override: false).
+    expect(await settingsOfMigrationCluster("", file)).toMatchObject({ shared_buffers: "128MB", max_connections: "100" });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS * 2);
 
   it("refuses a malformed setting before any cluster is started", async () => {

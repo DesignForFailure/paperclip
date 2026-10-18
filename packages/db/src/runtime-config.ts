@@ -96,7 +96,8 @@ function parseEnvFile(contents: string): Record<string, string> {
   return entries;
 }
 
-function readEnvEntries(envPath: string): Record<string, string> {
+/** The entries of an instance's `.env` file (`{}` when it is absent), parsed as `resolveDatabaseTarget` reads them. */
+export function readEnvEntries(envPath: string): Record<string, string> {
   if (!existsSync(envPath)) return {};
   return parseEnvFile(readFileSync(envPath, "utf8"));
 }

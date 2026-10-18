@@ -49,7 +49,7 @@ PAPERCLIP_EMBEDDED_POSTGRES_FLAGS="shared_buffers=64MB max_connections=20 work_m
 DATABASE_POOL_MAX=4
 ```
 
-- **Each pair** is given to `postgres` as `-c key=value` every time the server (or `pnpm db:migrate`) starts the cluster, including the server's restarts after an unexpected exit. Nothing is written to `postgresql.conf`, and initdb is not given them, so removing the variable puts the defaults back at the next start.
+- **Each pair** is given to `postgres` as `-c key=value` every time the server (or `pnpm db:migrate`, which reads it from the instance's `.env` too when the environment does not set it) starts the cluster, including the server's restarts after an unexpected exit. Nothing is written to `postgresql.conf`, and initdb is not given them, so removing the variable puts the defaults back at the next start.
 - **Refused** at startup, before any cluster starts, with an error naming the pair: anything that is not `key=value` with a value (so a value cannot hold whitespace, and `-c` is not written), and the settings Paperclip decides for the cluster: `port`, `listen_addresses`, `unix_socket_directories`, `data_directory`, `config_file`, `hba_file`, `ident_file`. PostgreSQL checks the names and values when the cluster starts; a wrong one stops the start with its message in the startup log.
 - **`max_connections`** must cover the server's pool (`DATABASE_POOL_MAX`, 10 by default) plus the one-connection clients it opens beside it (startup checks and migrations, and two during a backup), and anything else you connect.
 - **A cluster already running** when the server starts is reused as it is: its settings change at its next start by the server.

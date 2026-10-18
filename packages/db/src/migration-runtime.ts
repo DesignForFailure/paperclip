@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
-import { embeddedPostgresFlags } from "./embedded-postgres-flags.js";
+import { EMBEDDED_POSTGRES_FLAGS_ENV, embeddedPostgresFlags } from "./embedded-postgres-flags.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import {
   EmbeddedPostgresFixedPasswordError,
@@ -12,7 +12,7 @@ import {
   EMBEDDED_POSTGRES_INITDB_PASSWORD,
   embeddedPostgresUrl,
 } from "./embedded-postgres-password.js";
-import { resolveDatabaseTarget } from "./runtime-config.js";
+import { readEnvEntries, resolveDatabaseTarget } from "./runtime-config.js";
 
 type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
@@ -100,9 +100,16 @@ async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
 async function ensureEmbeddedPostgresConnection(
   dataDir: string,
   preferredPort: number,
+  envPath: string,
 ): Promise<MigrationConnection> {
-  // Read first, so a malformed setting stops the command before any cluster is started.
-  const configuredPostgresFlags = embeddedPostgresFlags();
+  // Read first, so a malformed setting stops the command before any cluster is started. The server loads the
+  // instance's .env without overriding the environment; this command does not load it, so the setting is read from it
+  // here the same way: the environment's value when it has one (even empty), else the file's.
+  const configuredPostgresFlags = embeddedPostgresFlags({
+    [EMBEDDED_POSTGRES_FLAGS_ENV]: EMBEDDED_POSTGRES_FLAGS_ENV in process.env
+      ? process.env[EMBEDDED_POSTGRES_FLAGS_ENV]
+      : readEnvEntries(envPath)[EMBEDDED_POSTGRES_FLAGS_ENV],
+  });
   const EmbeddedPostgres = await loadEmbeddedPostgresCtor();
   await prepareEmbeddedPostgresNativeRuntime();
   const selectedPort = await findAvailablePort(preferredPort);
@@ -215,5 +222,5 @@ export async function resolveMigrationConnection(): Promise<MigrationConnection>
     };
   }
 
-  return ensureEmbeddedPostgresConnection(target.dataDir, target.port);
+  return ensureEmbeddedPostgresConnection(target.dataDir, target.port, target.envPath);
 }

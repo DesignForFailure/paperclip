@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
+import { embeddedPostgresFlags } from "./embedded-postgres-flags.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import {
   EmbeddedPostgresFixedPasswordError,
@@ -100,6 +101,8 @@ async function ensureEmbeddedPostgresConnection(
   dataDir: string,
   preferredPort: number,
 ): Promise<MigrationConnection> {
+  // Read first, so a malformed setting stops the command before any cluster is started.
+  const configuredPostgresFlags = embeddedPostgresFlags();
   const EmbeddedPostgres = await loadEmbeddedPostgresCtor();
   await prepareEmbeddedPostgresNativeRuntime();
   const selectedPort = await findAvailablePort(preferredPort);
@@ -157,7 +160,8 @@ async function ensureEmbeddedPostgresConnection(
     port: selectedPort,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    postgresFlags,
+    // PAPERCLIP_EMBEDDED_POSTGRES_FLAGS first: a later -c wins, so a start's own flags (the private start's) stay as given.
+    postgresFlags: [...configuredPostgresFlags, ...postgresFlags],
     onLog: logBuffer.append,
     onError: logBuffer.append,
   });

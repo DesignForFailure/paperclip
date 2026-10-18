@@ -33,6 +33,7 @@ import {
   checkEmbeddedPostgresPassword,
   EMBEDDED_POSTGRES_INITDB_PASSWORD,
   embeddedPostgresUrl,
+  embeddedPostgresFlags,
   inspectMigrations,
   applyPendingMigrations,
   createEmbeddedPostgresLogBuffer,
@@ -452,6 +453,8 @@ async function startServerWithDatabaseTeardown(
       );
     }
     await prepareEmbeddedPostgresNativeRuntime();
+    // Fork (Continuum): PAPERCLIP_EMBEDDED_POSTGRES_FLAGS, read before anything starts so a malformed one stops here.
+    const configuredPostgresFlags = embeddedPostgresFlags();
   
     const dataDir = resolve(config.embeddedPostgresDataDir);
     const configuredPort = config.embeddedPostgresPort;
@@ -559,7 +562,8 @@ async function startServerWithDatabaseTeardown(
           port,
           persistent: true,
           initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          postgresFlags,
+          // The configured settings at every start (the supervisor's restarts too); a start's own flags last, so they win.
+          postgresFlags: [...configuredPostgresFlags, ...postgresFlags],
           onLog: appendEmbeddedPostgresLog,
           onError: appendEmbeddedPostgresLog,
         });

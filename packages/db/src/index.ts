@@ -38,6 +38,7 @@ export {
   prepareEmbeddedPostgresNativeRuntime,
 } from "./embedded-postgres-native.js";
 export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecycle.js";
+export { EMBEDDED_POSTGRES_FLAGS_ENV, embeddedPostgresFlags } from "./embedded-postgres-flags.js";
 export {
   EMBEDDED_POSTGRES_PASSWORD_FILE_ENV,
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
